@@ -23,6 +23,7 @@ the contract: implement against it, don't change it without saying so.
 | Model loading, ensemble inference | `models/` | core |
 | Ranking, diversity, output | `report.py` | agent |
 | **Orchestration of all of the above** | `commands/design.py` | core |
+| Scoring existing sets (+ metrics) | `commands/evaluate.py` | core |
 | CLI | `cli.py`, `commands/` | agent |
 | Deployment scaffolding | `deploy/` | agent |
 
@@ -32,6 +33,14 @@ the contract: implement against it, don't change it without saying so.
 Streamlit and Modal all call — the orchestration exists once, not three times.
 It records what it did into `DesignResult.params` (stride, geometries,
 conditions, device, per-stage timings), so an output file says what produced it.
+
+`lamp_design.evaluate(rows, ...)` is the second entry point, for sets that
+already exist. It skips generation and takes its target windows either from the
+input's `<type>_target_sequence` columns or by locating each primer in a target
+FASTA, then shares `thermo` and `predict_tp` with `design` — which is what
+makes the two commands' numbers comparable.
+`tests/test_evaluate.py::test_evaluate_and_design_agree_on_the_same_primer_set`
+pins that: the same set scored both ways must agree to 1e-4.
 
 The names in `lamp_design/__init__.py` are the **public surface** the front ends
 integrate against; import `lamp_design.predict_tp`, not
@@ -104,18 +113,66 @@ Deliberately listed, because each of these is easy to assume is present:
   kind — not against a host genome, not against related organisms. Every score
   is an *inclusivity* statement about the input panel. PrimerCast's bowtie2
   stage is the obvious model to borrow.
-- **`lamp-design evaluate`.** Scoring primer sets a user already has is still a
-  stub. It needs no new science — thermo plus inference minus generation — but
-  it is what a portal visitor with existing primers will reach for first.
 - **Validation of design *quality*.** What is validated is that this code
-  reproduces the published model's predictions (`tests/test_parity.py`). That
-  the top-ranked designs are good designs is a separate claim needing a
+  reproduces the published model's predictions (`tests/test_parity.py`) and
+  agrees with measured Tp on three real pathogens (below). That the
+  *top-ranked* designs are good designs is a separate claim, needing a
   retrospective check against known-good LAMP sets.
-- **Absolute Tp calibration outside the training distribution.** On synthetic
-  random templates with zero mismatches the ensemble predicts Tp ≈ 0 min, which
-  is not physical; the clip at 0 is doing real work. Treat the *ranking* as the
-  product and absolute minutes as indicative until checked on real pathogen
-  sequence.
+- **Absolute Tp calibration.** Measured on real data and it is real: see the
+  bias column below. Treat the *ranking* as the product and absolute minutes
+  as indicative.
+
+## Validated against measured Tp
+
+`lamp-design evaluate` scores primer sets that already exist, so the three
+pathogen datasets under `~/LAMP/lyra/datasets/LAMP/final/` — which carry
+measured Tp — are a direct check on the whole pipeline. Run
+2026-10-30 on an L4, ranking under each row's own master mix and
+concentration:
+
+| dataset | rows | ρ (amplified) | ρ (censored) | ROC-AUC | bias |
+|---|---|---|---|---|---|
+| LASV | 25,947 | 0.542 | 0.623 | **0.875** | +5.9 min |
+| mpox | 2,088 | 0.394 | 0.603 | **0.874** | −0.4 min |
+| Borrelia | 3,240 | 0.525 | 0.829 | 0.984 | +18.0 min |
+
+The paper's headline ROC-AUC is 0.875 (95% CI 0.866–0.883). LASV reproduces it
+to three decimals and mpox to 0.874, which is the strongest evidence available
+that this reimplementation is the published model and not merely something
+correlated with it.
+
+Three things to read off this table rather than from the single number:
+
+1. **Discrimination is much better than regression.** ROC-AUC asks "will this
+   amplify inside 30 min" and gets 0.87–0.98. Spearman restricted to reactions
+   that *did* amplify asks "how fast, among the ones that work" and gets
+   0.39–0.54. Most of the censored ρ is the easy amplify/no-amplify split. The
+   portal's job is the first question, which is the one the model is good at.
+2. **Absolute minutes carry a real offset**, and its sign is not stable across
+   pathogens: +18 min on Borrelia, −0.4 on mpox. This is the concrete version
+   of the calibration caveat above. Rank, do not quote.
+3. **Censoring convention matters**, so both populations are always reported.
+   A blank Tp means the reaction never amplified, censored at 60 min to match
+   the training data's `tp60_censored` flag.
+
+### The Tm bug this check found
+
+The same comparison against the training CSVs' own `*_tm` columns showed our
+Tm was **+2.17 °C off on every primer**, while mismatches, GC and ΔG were
+exact. Cause: **primer3-py 2.1.0 changed the santalucia salt correction.** The
+training data was generated with 2.0.x; `>=2.0` with no upper bound resolved to
+2.4.0 here. Versions 1.1.0–2.0.3 reproduce the training column exactly,
+2.1.0+ do not.
+
+`pyproject.toml` and the `Dockerfile` now pin `primer3-py>=2.0,<2.1`, and
+`tests/test_thermo.py` asserts a known Tm value from the training data so a
+future bump fails loudly instead of biasing every prediction.
+
+Isolating the effect (same rows, our Tm vs the CSV's) put it at **1.4 min mean
+and 5.4 min max per prediction, with the two prediction vectors rank-correlated
+at 0.99**. So it mattered for absolute Tp and barely at all for ranking — worth
+fixing for exactness, but *not* the cause of the bias in the table above. That
+bias is the model generalizing to a held-out pathogen.
 
 ## Performance notes
 
@@ -245,6 +302,35 @@ never against another implementation.
 That run also quantified the dedup argument: 400 CSV rows × 8 primers = 3,200
 primer-target slots collapse to 196 unique (primer, window) pairs, a 16×
 redundancy factor.
+
+This was later re-checked at much larger scale through `evaluate`, against all
+four physics features on all three pathogen datasets — 32,752 primer-window
+pairs on LASV alone. Every feature agrees to `max|diff| = 0.00000`; the
+residual at the 1e-6 level is float32 storage, not arithmetic. That check is
+the one that caught the Tm pin, so it is worth re-running after any dependency
+change: `scratchpad/thermo_parity.py` in the session notes, or just compare a
+`thermo_from_windows` call against the CSV's own columns.
+
+### Scaling out on Modal
+
+Modal bills per GPU-second, so N containers that each do 1/N of the work cost
+the same as one container and finish in roughly 1/N of the wall clock — minus
+one cold start each. That makes fanning out close to free, and it is why
+`design_fanout` shards **candidate sets** across GPU containers rather than
+splitting the pipeline by stage.
+
+Sharding by candidate works because a candidate's predicted Tp is independent
+of every other candidate's; ranking is the only step that needs them together,
+and it runs on the orchestrator after the merge. An earlier version of that
+function fanned out *thermo only* and kept inference on a single GPU, which
+caps at about 1.1× no matter how many containers it gets — thermo is 10.5% of
+a run.
+
+Free-plan limits (confirmed on modal.com/pricing, 2026-10-30): **10 concurrent
+GPUs, 100 containers, $30/month of credit**. At L4 pricing of $0.000222/s, the
+7.7-minute sweep is ~410 GPU-seconds ≈ **$0.09 per run**, so the free credit is
+on the order of 300 full-sweep runs per month. Ten-way fan-out should bring
+that sweep to roughly 1–1.5 min wall clock at the same price.
 
 ## Layout
 

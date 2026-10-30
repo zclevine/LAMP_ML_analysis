@@ -383,12 +383,59 @@ def compute_thermo(
             windows_per_pair.append(windows)
             primers_per_pair.append([p.sequence for p in ordered])
 
-    n_pairs = len(pair_sets)
+    return thermo_from_windows(
+        pair_sets,
+        pair_targets,
+        primers_per_pair,
+        windows_per_pair,
+        threads=threads,
+        backend=backend,
+    )
+
+
+def thermo_from_windows(
+    set_ids: Sequence[str],
+    target_names: Sequence[str],
+    primers_per_pair: Sequence[Sequence[str]],
+    windows_per_pair: Sequence[Sequence[str]],
+    *,
+    threads: Optional[int] = None,
+    backend: str = "auto",
+) -> ThermoTable:
+    """Physics features for pairs whose target windows are already known.
+
+    This is the half of :func:`compute_thermo` after window resolution, split
+    out because ``evaluate`` gets its windows from somewhere else entirely:
+    either read straight out of a results CSV's ``<type>_target_sequence``
+    columns, or found by searching a target for the primer. Sharing the
+    function rather than the arithmetic is what guarantees a primer set scores
+    identically whether it arrived from generation or from a spreadsheet.
+
+    Each of ``primers_per_pair`` and ``windows_per_pair`` is one row of eight
+    sequences in :data:`PRIMER_TYPE_ORDER`, with reverse-strand primers and
+    their windows already reverse-complemented by the caller.
+    """
+    n_types = len(PRIMER_TYPE_ORDER)
+    n_pairs = len(set_ids)
     values = np.zeros((n_pairs, n_types, len(PHYSICS_FEATURES)), dtype=np.float32)
     globals_ = np.zeros((n_pairs, len(GLOBAL_PHYSICS_FEATURES)), dtype=np.float32)
     target_windows = np.empty((n_pairs, n_types), dtype=object)
     if n_pairs == 0:
         return ThermoTable([], [], values, globals_, target_windows)
+
+    bad = [
+        i
+        for i, (prow, wrow) in enumerate(zip(primers_per_pair, windows_per_pair))
+        if len(prow) != n_types or len(wrow) != n_types
+    ]
+    if bad:
+        raise ValueError(
+            f"every row needs exactly {n_types} primers and {n_types} windows; "
+            f"rows {bad[:5]} do not"
+        )
+
+    set_ids = list(set_ids)
+    target_names = list(target_names)
 
     # --- unique primers: Tm and GC (primer-only, so once per sequence) -----
     unique_primers = sorted({p for row in primers_per_pair for p in row})
@@ -434,8 +481,8 @@ def compute_thermo(
         globals_[row, g_dg] = values[row, :, i_dg].mean()
 
     return ThermoTable(
-        set_ids=pair_sets,
-        target_names=pair_targets,
+        set_ids=set_ids,
+        target_names=target_names,
         values=values,
         globals_=globals_,
         target_windows=target_windows,
@@ -448,6 +495,7 @@ __all__ = [
     "WindowResolver",
     "compute_dg",
     "compute_thermo",
+    "thermo_from_windows",
     "compute_tm",
     "count_mismatches_vectorized",
     "gc_fraction",

@@ -35,7 +35,7 @@ Channel layout (19 = ``model_config['d_input']``)::
 
 from __future__ import annotations
 
-from typing import Dict, Mapping, Sequence, Tuple
+from typing import Dict, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -118,21 +118,31 @@ def encode_primer_target_pair(
     return combined
 
 
-def encode_master_mix(value: str) -> np.ndarray:
-    """3-way one-hot over (SS, BST, WS); unknown -> all zeros.
+def canonical_master_mix(value: str) -> Optional[str]:
+    """Map a master-mix label onto one of :data:`MASTER_MIXES`, or ``None``.
 
-    Mirrors ``canonical_master_mix`` + ``encode_master_mix``. The BstXT
-    aliases collapse onto ``BST``, which is what the training data pooled.
+    The training data spells the same three mixes several ways, so the aliases
+    are collapsed here: the ``BstXT`` variants onto ``BST`` and the SYTO9 /
+    no-UDG variants onto ``WS``, which is the pooling the training labels used.
+
+    ``None`` means "not a mix this model was trained on". Callers should treat
+    that as something to report, not something to pass on quietly:
+    :func:`encode_master_mix` turns it into an all-zero one-hot, which the
+    model will happily consume and score against no mix at all.
     """
     mm = str(value).strip().upper()
     if mm == "SS":
-        canon = "SS"
-    elif mm in {"BST", "BSTXT", "BSTXT-DK", "BSTXT-MM", "BSTXT_MM"}:
-        canon = "BST"
-    elif mm in {"WS", "WS-NOUDG", "WS-SYTO9", "WS_SYTO9"}:
-        canon = "WS"
-    else:
-        canon = "UNK"
+        return "SS"
+    if mm in {"BST", "BSTXT", "BSTXT-DK", "BSTXT-MM", "BSTXT_MM"}:
+        return "BST"
+    if mm in {"WS", "WS-NOUDG", "WS-SYTO9", "WS_SYTO9"}:
+        return "WS"
+    return None
+
+
+def encode_master_mix(value: str) -> np.ndarray:
+    """3-way one-hot over (SS, BST, WS); unknown -> all zeros."""
+    canon = canonical_master_mix(value)
     return np.array([1.0 if canon == m else 0.0 for m in MASTER_MIXES], dtype=np.float32)
 
 
@@ -251,6 +261,7 @@ __all__ = [
     "physics_flat_names",
     "one_hot_encode_nucleotide",
     "encode_primer_target_pair",
+    "canonical_master_mix",
     "encode_master_mix",
     "encode_target_concentration",
     "physics_raw",

@@ -128,7 +128,10 @@ PIP_PINS = (
     "numpy==2.2.6",
     "pandas==2.3.3",
     "biopython==1.88",
-    "primer3-py==2.4.0",
+    # Held below 2.1: 2.1.0 changed the santalucia salt correction and shifts
+    # every Tm +2.17 C off the values the model was trained on. Must match the
+    # bound in pyproject.toml.
+    "primer3-py==2.0.3",
     "scipy==1.15.3",
 )
 
@@ -136,16 +139,41 @@ PIP_PINS = (
 # Tunables (deploy-time environment, so you can retune without editing code)
 # ---------------------------------------------------------------------------
 
-#: The ensemble is ~100K parameters x 5 seeds. A T4 is already oversized for
-#: it; A100s would be pure waste. If measurement shows the GPU buys nothing
-#: over 16 CPU cores -- plausible for a net this small -- set `gpu=None` on
-#: `infer` and `design_single_container` and delete the GPU entirely. The
-#: fan-out exists because thermo dominates, not because the model is heavy.
-GPU = os.environ.get("LAMP_DESIGN_MODAL_GPU", "T4")
+#: The GPU is what matters, and the measurement says so: a 5 kb x 10 target x
+#: stride 1 x 4 condition sweep is 7.7 min on one L4 against ~76 min on 8 CPU
+#: cores, a 15x gap, with inference 89% of the run and thermo 10.5%. The
+#: ensemble is small (~100K parameters x 5 seeds, 3.4 GB peak, 18-29% L4
+#: utilization), so a *bigger* GPU buys almost nothing -- more of them is the
+#: lever, which is what `design_fanout` is for.
+GPU = os.environ.get("LAMP_DESIGN_MODAL_GPU", "L4")
 
-#: Fan-out width for the CPU thermo stage. This is container concurrency, not
-#: input concurrency: thermo is CPU-bound, so packing several inputs into one
-#: container (`@modal.concurrent`) would just contend for the same cores.
+#: GPU containers the inference fan-out spreads shards across. Modal's free
+#: Starter plan allows 10 concurrent GPUs and 100 containers; Team allows 50
+#: and 5,000. Default to the free-plan ceiling so an unconfigured deploy does
+#: not queue behind its own limit.
+#:
+#: Billing is per GPU-second, so N containers for 1/N of the wall clock costs
+#: the same as one container -- minus a few seconds of extra cold start each.
+#: That is the whole argument for fanning out: it is close to free.
+INFER_MAX_CONTAINERS = int(os.environ.get("LAMP_DESIGN_INFER_CONTAINERS", "10"))
+
+#: Cores per inference container. Encoding rows for the GPU is single-threaded
+#: and runs at ~5,450 rows/s, about 42% of the GPU inference stage, so each
+#: container wants a couple of cores rather than one -- but not many, because
+#: nothing here is CPU-parallel yet. See the "pipelining" note in
+#: docs/ARCHITECTURE.md.
+INFER_CPUS = float(os.environ.get("LAMP_DESIGN_INFER_CPUS", "4"))
+
+#: Primer sets per shard. Each shard does its own thermo and inference, so a
+#: shard must do enough work to amortise a container cold start (seconds) plus
+#: loading five checkpoints. At the measured ~2,300 predictions/s and 4
+#: conditions, 2,000 sets is roughly 35s of GPU work per shard.
+INFER_SHARD_SETS = int(os.environ.get("LAMP_DESIGN_INFER_SHARD_SETS", "2000"))
+
+#: Fan-out width for the CPU thermo stage, used only by the legacy thermo-only
+#: fan-out path. Retained because a very wide panel (many targets) shifts the
+#: balance back toward thermo, but it is not the default: thermo is 10.5% of a
+#: representative run, so fanning it out alone caps at a 1.1x speedup.
 THERMO_MAX_CONTAINERS = int(os.environ.get("LAMP_DESIGN_THERMO_CONTAINERS", "50"))
 THERMO_CPUS = float(os.environ.get("LAMP_DESIGN_THERMO_CPUS", "2"))
 
@@ -313,6 +341,13 @@ ENGINE_API: dict[str, tuple[str, str]] = {
     "build_design_result": (
         "lamp_design.build_design_result",
         "lamp_design.report.build_design_result",
+    ),
+    # mismatch_map(thermo) -> {(set_id, target_name): total_mismatches}
+    # Used by the shard fan-out to ship per-pair mismatch counts back to the
+    # orchestrator without shipping the whole ThermoTable.
+    "mismatch_map": (
+        "lamp_design.mismatch_map",
+        "lamp_design.models.bridge.mismatch_map",
     ),
     # result_to_dict(result, *, ranking_condition, tp_threshold) -> dict
     "result_to_dict": ("lamp_design.result_to_dict", "lamp_design.report.result_to_dict"),
@@ -737,6 +772,44 @@ def _thermo_pool(primer_sets: list, panel: Any, n_workers: int) -> Any:
     return _concat_thermo(tables)
 
 
+def _condition_from_request(req: dict) -> Any:
+    """The single reaction condition a request is scored under.
+
+    One place, because the orchestrator, the shards and the single-container
+    path all have to agree on it: a shard that predicted under a different
+    condition than the one the result is labelled with would be undetectable
+    in the output.
+    """
+    from lamp_design.types import Condition
+
+    return Condition(master_mix=req["master_mix"], target_conc=req["target_conc"])
+
+
+def _predictions_to_json(predictions: list) -> list:
+    """Predictions as plain rows, for returning from a shard."""
+    return [
+        [p.set_id, p.target_name, p.condition.master_mix,
+         float(p.condition.target_conc), float(p.tp_minutes), float(p.tp_std)]
+        for p in predictions
+    ]
+
+
+def _predictions_from_json(rows: list) -> list:
+    """Inverse of :func:`_predictions_to_json`."""
+    from lamp_design.types import Condition, Prediction
+
+    return [
+        Prediction(
+            set_id=set_id,
+            target_name=target,
+            condition=Condition(master_mix=mix, target_conc=conc),
+            tp_minutes=tp,
+            tp_std=std,
+        )
+        for set_id, target, mix, conc, tp, std in rows
+    ]
+
+
 def _infer_stage(
     thermo: Any,
     panel: Any,
@@ -747,9 +820,7 @@ def _infer_stage(
     warnings: list,
 ) -> Any:
     """Assembled features -> DesignResult."""
-    from lamp_design.types import Condition
-
-    condition = Condition(master_mix=req["master_mix"], target_conc=req["target_conc"])
+    condition = _condition_from_request(req)
     weights = _resolve_weights()
 
     # `predict_tp` takes the primer sets, not the panel: ThermoTable holds the
@@ -1015,11 +1086,33 @@ def infer(run_id: str, thermo_tables: list, req: dict, timing: dict) -> dict:
     volumes={RESULTS_REMOTE: results_volume},
 )
 def design_fanout(request: dict) -> dict:
-    """SCALE-UP PATH: CPU fan-out for thermo, one GPU container for inference.
+    """SCALE-UP PATH: shard the candidates across many GPU containers.
 
     Prepare and generation run inline here rather than in their own Modal
-    functions: they are cheap, and the orchestrator already holds a CPU
-    container, so separate functions would only add cold starts.
+    functions: they are cheap (0.5s of a 7.7 min run), and the orchestrator
+    already holds a CPU container, so separate functions would only add cold
+    starts.
+
+    ## Why shard candidates rather than stages
+
+    Every candidate set's predicted Tp is independent of every other's --
+    ranking is the only step that sees them together, and it happens here at
+    the end. So the whole thermo + inference span is embarrassingly parallel
+    over candidate sets, and a shard can do both stages locally instead of
+    shipping a ThermoTable between containers.
+
+    That matters because of where the time actually goes: inference is 89% of
+    a representative run and thermo 10.5%. Fanning out thermo alone -- which
+    is what this function used to do -- caps at about 1.1x no matter how many
+    containers it gets. Sharding the pair makes both stages scale.
+
+    ## Why this is nearly free
+
+    Modal bills per GPU-second. The total GPU-seconds of work does not change
+    when it is spread over more containers, so N shards cost the same as one
+    and finish in roughly 1/N of the wall clock. The only extra is a cold
+    start per container, which is why :data:`INFER_SHARD_SETS` is sized so a
+    shard does tens of seconds of work.
     """
     import json
 
@@ -1033,7 +1126,8 @@ def design_fanout(request: dict) -> dict:
     timing["prepare"] = time.time() - started
     panel = prepared.panel
 
-    # Publish the shared inputs once; the thermo workers read them from here.
+    # Publish the shared inputs once; every shard reads them from here rather
+    # than having the panel serialized into each of its arguments.
     (run_dir / "panel.json").write_text(json.dumps(_panel_to_json(panel)))
     (run_dir / "candidates.json").write_text(
         json.dumps([_set_to_json(s) for s in primer_sets])
@@ -1049,21 +1143,100 @@ def design_fanout(request: dict) -> dict:
     )
     results_volume.commit()
 
-    chunks = [
-        {"run_id": run_id, "sets": [_set_to_json(s) for s in chunk]}
-        for chunk in _chunked(primer_sets, THERMO_CHUNK_SIZE)
+    shards = [
+        {"run_id": run_id, "sets": [_set_to_json(s) for s in shard], "req": req}
+        for shard in _chunked(primer_sets, INFER_SHARD_SETS)
     ]
     print(
         f"run={run_id} targets={panel.n_targets} budget={panel.budget} "
-        f"sets={len(primer_sets)} chunks={len(chunks)} max_containers={THERMO_MAX_CONTAINERS}",
+        f"sets={len(primer_sets)} shards={len(shards)} "
+        f"max_containers={INFER_MAX_CONTAINERS} gpu={GPU}",
         flush=True,
     )
 
     started = time.time()
-    tables = list(thermo_chunk.map(chunks))
-    timing["thermo"] = time.time() - started
+    predictions: list = []
+    mismatches: dict = {}
+    n_pairs = 0
+    for shard_result in design_shard.map(shards):
+        predictions.extend(_predictions_from_json(shard_result["predictions"]))
+        mismatches.update(
+            {(s, t): m for s, t, m in shard_result["mismatches"]}
+        )
+        n_pairs += shard_result["n_pairs"]
+    timing["shards"] = time.time() - started
+    print(
+        f"run={run_id} merged {len(predictions):,} predictions over "
+        f"{n_pairs:,} pairs from {len(shards)} shard(s)",
+        flush=True,
+    )
 
-    return infer.remote(run_id, tables, req, timing)
+    # Ranking is the one step that needs every candidate at once, so it runs
+    # here, after the merge, on the orchestrator's CPU.
+    started = time.time()
+    result = _engine("build_design_result")(
+        predictions,
+        primer_sets,
+        panel,
+        ranking_condition=_condition_from_request(req),
+        tp_threshold=req["tp_threshold_minutes"],
+        n=req["n_sets"],
+        min_separation=req["min_separation"],
+        mismatches=mismatches,
+        funnel=funnel,
+        excluded_targets=dict(prepared.excluded),
+        warnings=list(prepared.warnings),
+    )
+    timing["rank"] = time.time() - started
+    timing["total"] = sum(timing.values())
+    envelope = _finish(result, req, run_dir, timing)
+    results_volume.commit()
+    return envelope
+
+
+@app.function(
+    gpu=GPU,
+    cpu=INFER_CPUS,
+    max_containers=INFER_MAX_CONTAINERS,
+    timeout=3600,
+    retries=1,
+    secrets=SECRETS,
+    volumes={
+        WEIGHTS_REMOTE: _read_only(weights_volume),
+        RESULTS_REMOTE: results_volume,
+    },
+)
+def design_shard(job: dict) -> dict:
+    """Thermo + inference for one shard of candidate sets.
+
+    Returns predictions and per-pair mismatch counts rather than a
+    ``ThermoTable``: the orchestrator only needs those two things to rank, and
+    they are a few hundred bytes per pair against a ThermoTable's arrays.
+    """
+    import json
+
+    results_volume.reload()
+    run_dir = _run_dir(job["run_id"])
+    panel = _panel_from_json(json.loads((run_dir / "panel.json").read_text()))
+    primer_sets = [_set_from_json(blob) for blob in job["sets"]]
+    req = job["req"]
+
+    thermo = _compute_chunk(primer_sets, panel)
+    predictions = _engine("predict_tp")(
+        thermo,
+        primer_sets,
+        [_condition_from_request(req)],
+        weights=_resolve_weights(),
+        device=_device(),
+    )
+    return {
+        "predictions": _predictions_to_json(predictions),
+        "mismatches": [
+            [set_id, target, int(count)]
+            for (set_id, target), count in _engine("mismatch_map")(thermo).items()
+        ],
+        "n_pairs": len(thermo.set_ids),
+    }
 
 
 # ---------------------------------------------------------------------------

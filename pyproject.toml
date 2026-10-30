@@ -11,7 +11,10 @@ dependencies = [
     "numpy>=1.26",
     "pandas>=2.0",
     "biopython>=1.83",
-    "primer3-py>=2.0",
+    # Pinned below 2.1: the training data's tm column was computed with 2.0.x,
+    # and 2.1.0 changed santalucia salt correction so every Tm shifts +2.17 C.
+    # Verified exact on all 80 Borrelia primers at 2.0.0-2.0.3, off at 2.1.0+.
+    "primer3-py>=2.0,<2.1",
     "ViennaRNA>=2.6",
     "torch>=2.2",
     "scipy>=1.11",

@@ -165,43 +165,41 @@ class TestDispatch:
         assert exc.value.code == EXIT_INPUT_ERROR
         assert "error: " in capsys.readouterr().err
 
-    # `design` is implemented, so only `evaluate` is still a stub. If this list
-    # empties, delete the stub machinery in cli.py along with these tests.
-    @pytest.mark.parametrize(
-        "argv",
-        [
-            ["evaluate", "--in", "primers.tsv", "--targets", "panel.json", "--out", "s.tsv"],
-        ],
-    )
-    def test_unimplemented_commands_raise_clearly(self, argv, monkeypatch):
-        monkeypatch.delenv(WEIGHTS_ENV_VAR, raising=False)
-        with pytest.raises(NotImplementedError) as exc:
-            main(argv)
-        message = str(exc.value)
-        assert f"`lamp-design {argv[0]}` is not implemented yet" in message
-        assert WEIGHTS_ENV_VAR in message
+    def test_every_command_is_real(self):
+        """No stubs remain, and each subcommand dispatches to its own module.
 
-    def test_design_is_no_longer_a_stub(self):
-        """The self-replacing registration actually picked up commands/design.py."""
-        from lamp_design.commands import design as design_module
+        The stub machinery this replaces existed while the pipeline was being
+        built; `evaluate` was the last placeholder. If a command module ever
+        goes missing, `build_parser` should now raise on import rather than
+        quietly registering something that refuses to run.
+        """
+        from lamp_design.commands import design, evaluate, prepare
 
         parser = build_parser()
         action = next(
             a for a in parser._actions if isinstance(a, argparse._SubParsersAction)
         )
-        assert "design" in action.choices
-        assert action.choices["design"].get_default("func") is design_module.run
-        assert "NOT IMPLEMENTED" not in (action.choices["design"].description or "")
+        expected = {"prepare": prepare, "design": design, "evaluate": evaluate}
+        assert set(action.choices) == set(expected)
+        for name, module in expected.items():
+            subparser = action.choices[name]
+            assert subparser.get_default("func") is module.run, name
+            assert "NOT IMPLEMENTED" not in (subparser.description or ""), name
 
-    def test_stub_reports_resolved_weights(self, tmp_path):
-        with pytest.raises(NotImplementedError) as exc:
-            main(
-                [
-                    "evaluate", "--in", "primers.tsv", "--targets", "panel.json",
-                    "--out", "s.tsv", "--weights", str(tmp_path),
-                ]
-            )
-        assert f"Weights resolve to {tmp_path}" in str(exc.value)
+    def test_a_missing_command_module_is_not_swallowed(self, monkeypatch):
+        """A broken command must surface, not degrade into a usable-looking CLI."""
+        import importlib
+
+        real = importlib.import_module
+
+        def fail(name, *args, **kwargs):
+            if name == "lamp_design.commands.evaluate":
+                raise ModuleNotFoundError(f"No module named {name!r}", name=name)
+            return real(name, *args, **kwargs)
+
+        monkeypatch.setattr(importlib, "import_module", fail)
+        with pytest.raises(ModuleNotFoundError):
+            build_parser()
 
     @pytest.mark.parametrize("command", ["design", "evaluate"])
     def test_bad_weights_path_is_a_user_error(self, command, tmp_path, capsys):
@@ -279,8 +277,8 @@ class TestWeightsResolution:
 
 
 class TestCommandRegistration:
-    def test_a_real_command_module_replaces_the_stub(self, monkeypatch):
-        """When commands/design.py lands, cli.py picks it up with no edit."""
+    def test_a_command_module_is_handed_the_subparsers(self, monkeypatch):
+        """Registration is by module name, so a new command needs no edit here."""
         registered = []
         fake = types.SimpleNamespace(register=lambda sub: registered.append(sub))
         monkeypatch.setattr(
@@ -288,20 +286,24 @@ class TestCommandRegistration:
             lambda path: fake if path == "lamp_design.commands.design" else pytest.fail(path),
         )
 
-        def fallback(_sub):
-            pytest.fail("the stub must not be used when the module exists")
-
         parser = build_parser.__globals__["argparse"].ArgumentParser()
         subparsers = parser.add_subparsers()
-        _register_command(subparsers, "design", fallback=fallback)
+        _register_command(subparsers, "design")
 
         assert registered == [subparsers]
 
-    def test_a_missing_dependency_is_not_hidden_behind_the_stub(self, monkeypatch):
+    def test_a_missing_dependency_surfaces(self, monkeypatch):
+        """A command whose own imports are broken must fail loudly.
+
+        There used to be a stub fallback that a ModuleNotFoundError could hide
+        behind; registration is now unconditional, so this just has to stay
+        true.
+        """
+
         def boom(path):
             raise ModuleNotFoundError("No module named 'torch'", name="torch")
 
         monkeypatch.setattr("importlib.import_module", boom)
 
         with pytest.raises(ModuleNotFoundError, match="torch"):
-            _register_command(None, "design", fallback=lambda _sub: None)
+            _register_command(None, "design")

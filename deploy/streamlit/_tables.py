@@ -1,0 +1,207 @@
+"""Result payload -> dataframes. Pandas only, no streamlit.
+
+Reads the shape ``report.result_to_dict`` produces: ``sets`` with ``primers`` as
+a list in frozen ``PRIMER_TYPE_ORDER``, ``per_target`` and ``predictions`` as
+lists, and the column names ``report.py`` uses, which spell out their direction
+("..._lower_is_faster"). Kept apart from the rendering so the tables can be
+built and checked without a Streamlit session.
+"""
+
+from __future__ import annotations
+
+import re
+from typing import Any
+
+import pandas as pd
+
+SPEED_FIELD = "mean_predicted_tp_minutes_lower_is_faster"
+INCLUSIVITY_FIELD = "inclusivity_fraction_targets_below_tp_threshold"
+
+
+def sets_frame(result: dict) -> pd.DataFrame:
+    """One row per returned set: rank, placement, scores, the eight primers."""
+    rows = []
+    for entry in result["sets"]:
+        row: dict[str, Any] = {
+            "rank": entry["rank"],
+            "set_id": entry["set_id"],
+            "anchor": entry["anchor"],
+            "geometry": entry["geometry_id"],
+            "span_start": entry["span_start"],
+            "span_end": entry["span_end"],
+            "mean_tp_min": entry[SPEED_FIELD],
+            "inclusivity": entry[INCLUSIVITY_FIELD],
+            "slowest_target": entry.get("slowest_target_name"),
+            "slowest_tp_min": entry.get("slowest_predicted_tp_minutes"),
+            "total_mismatches": entry.get("total_primer_target_mismatches_all_targets"),
+        }
+        for primer in entry["primers"]:
+            row[primer["primer_type"]] = primer["sequence"]
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def target_matrix(result: dict, field_name: str) -> pd.DataFrame:
+    """Rows = ranked sets, columns = the panel's targets."""
+    targets = result["panel"]["target_names"]
+    rows = []
+    for entry in result["sets"]:
+        by_target = {p["target_name"]: p.get(field_name) for p in entry["per_target"]}
+        row: dict[str, Any] = {"rank": entry["rank"], "set_id": entry["set_id"]}
+        row.update({name: by_target.get(name) for name in targets})
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def primers_frame(result: dict) -> pd.DataFrame:
+    """One row per primer, for ordering and for pasting into a plate map."""
+    rows = []
+    for entry in result["sets"]:
+        for primer in entry["primers"]:
+            rows.append(
+                {
+                    "rank": entry["rank"],
+                    "set_id": entry["set_id"],
+                    "primer_type": primer["primer_type"],
+                    "strand": primer.get("strand"),
+                    "sequence": primer["sequence"],
+                    "start": primer["start"],
+                    "end": primer["end"],
+                    "length": primer["length"],
+                }
+            )
+    return pd.DataFrame(rows)
+
+
+def condition_labels(result: dict) -> list[str]:
+    """Condition labels in the order the engine scored them."""
+    seen: list[str] = []
+    for entry in result["sets"]:
+        for prediction in entry.get("predictions") or []:
+            label = _condition_label(prediction)
+            if label not in seen:
+                seen.append(label)
+    return seen
+
+
+def _condition_label(prediction: dict) -> str:
+    return f"{prediction['master_mix']}@{prediction['target_conc']:,.0f}"
+
+
+def conditions_frame(result: dict) -> pd.DataFrame:
+    """Rows = ranked sets, columns = conditions, values = mean predicted Tp.
+
+    The ranking collapses every condition into one number per set; this is how
+    that number degrades across the sweep, which is the whole reason several
+    conditions are scored.
+    """
+    labels = condition_labels(result)
+    if not labels:
+        return pd.DataFrame()
+    rows = []
+    for entry in result["sets"]:
+        totals: dict[str, list[float]] = {label: [] for label in labels}
+        for prediction in entry.get("predictions") or []:
+            totals[_condition_label(prediction)].append(prediction["predicted_tp_minutes"])
+        row: dict[str, Any] = {"rank": entry["rank"], "set_id": entry["set_id"]}
+        for label in labels:
+            values = totals[label]
+            row[label] = sum(values) / len(values) if values else None
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def funnel_frame(result: dict) -> pd.DataFrame:
+    """The candidate funnel, in pipeline order."""
+    funnel = result.get("funnel") or {}
+    return pd.DataFrame(
+        [{"stage": stage, "candidates remaining": count} for stage, count in funnel.items()]
+    )
+
+
+def funnel_culprit(result: dict) -> str | None:
+    """The first funnel stage whose count is zero, if any.
+
+    Every stage records its surviving-candidate count into
+    ``DesignResult.funnel`` precisely so that "no candidates" can name the
+    filter that did it.
+    """
+    funnel = result.get("funnel") or {}
+    return next((stage for stage, count in funnel.items() if count == 0), None)
+
+
+def timings_frame(envelope: dict) -> pd.DataFrame:
+    """Per-stage timings with each stage's share of the total.
+
+    Shares are computed over the engine's own ``timings_s`` keys only. The
+    envelope also carries coarser totals (``design_s``, ``total``) which are
+    sums of those, so including them would double-count.
+    """
+    timings = envelope.get("timing_seconds") or {}
+    stage_keys = [
+        key
+        for key in ("prepare_s", "generation_s", "thermo_s", "model_load_s", "inference_s",
+                    "report_s", "evaluate_s")
+        if key in timings
+    ]
+    total = sum(float(timings[key]) for key in stage_keys) or 1.0
+    rows = [
+        {
+            "stage": key[:-2] if key.endswith("_s") else key,
+            "seconds": round(float(timings[key]), 2),
+            "share": float(timings[key]) / total,
+        }
+        for key in stage_keys
+    ]
+    other = [key for key in timings if key not in stage_keys and key != "total"]
+    for key in other:
+        rows.append({"stage": f"{key} (total)", "seconds": round(float(timings[key]), 2),
+                     "share": None})
+    return pd.DataFrame(rows)
+
+
+_GEOMETRY_ID = re.compile(r"geometry_id='([^']+)'")
+
+
+def geometry_names(params: dict) -> list[str]:
+    """Readable geometry names out of ``DesignResult.params['geometries']``.
+
+    ``design()`` records ``getattr(g, "name", str(g))`` and ``Geometry`` exposes
+    ``geometry_id`` rather than ``name``, so what lands in the result is the
+    whole dataclass repr. Pulling the id back out is a display concern and
+    belongs here rather than in the engine.
+    """
+    names = []
+    for entry in params.get("geometries") or []:
+        match = _GEOMETRY_ID.search(str(entry))
+        names.append(match.group(1) if match else str(entry))
+    return names
+
+
+def run_facts(envelope: dict) -> dict[str, Any]:
+    """What the run actually did, from ``DesignResult.params``.
+
+    ``design()`` records stride, geometries, conditions, device, batch size and
+    the candidate / pair / prediction counts into ``params`` so an output says
+    what produced it. Surfacing it here is the difference between "20 sets" and
+    "20 sets out of 940,520 predictions on cuda".
+    """
+    params = (envelope.get("result") or {}).get("params") or {}
+    timings = envelope.get("timing_seconds") or {}
+    return {
+        "device": params.get("device"),
+        "batch_size": params.get("batch_size"),
+        "stride": params.get("stride"),
+        "geometries": geometry_names(params),
+        "conditions": params.get("conditions"),
+        "ranking_condition": params.get("ranking_condition"),
+        "n_candidates": params.get("n_candidates"),
+        "n_pairs": params.get("n_pairs"),
+        "n_predictions": params.get("n_predictions"),
+        "total_seconds": timings.get("total"),
+        "predictions_per_second": (
+            params["n_predictions"] / timings["inference_s"]
+            if params.get("n_predictions") and timings.get("inference_s")
+            else None
+        ),
+    }

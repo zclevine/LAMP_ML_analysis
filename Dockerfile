@@ -45,13 +45,18 @@ LABEL org.opencontainers.image.description="ML-guided LAMP primer set design (CP
 #
 # Channel order matches PrimerCast: pytorch (for `cpuonly`), bioconda (mafft,
 # viennarna, primer3-py), conda-forge (everything else).
+#
+# primer3-py is held below 2.1 deliberately: 2.1.0 changed the santalucia salt
+# correction, which shifts every primer Tm by +2.17 C away from the values the
+# model was trained on. The bound must match pyproject.toml -- see the Tm
+# parity test in tests/test_thermo.py.
 RUN micromamba install -y -n base \
         -c pytorch -c bioconda -c conda-forge \
         python=3.10 \
         pytorch cpuonly \
         viennarna \
         mafft \
-        primer3-py \
+        "primer3-py>=2.0,<2.1" \
         biopython \
         numpy \
         pandas \

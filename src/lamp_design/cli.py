@@ -5,11 +5,11 @@ Single entry point, argparse subcommands, one module per command exposing
 ``register(subparsers)`` -- the same shape as ``primercast.cli``, because this
 engine gets handed to that codebase's maintainer for portal integration.
 
-``prepare`` is implemented. ``design`` and ``evaluate`` are registered as
-stubs so the command surface is visible while the rest of the pipeline is
-built; when ``lamp_design/commands/design.py`` or ``evaluate.py`` lands with a
-``register(subparsers)`` function, :func:`build_parser` picks it up and the
-stub disappears -- no edit to this file required.
+All three commands are implemented: ``prepare`` (align and QC an input
+panel), ``design`` (search for new primer sets) and ``evaluate`` (score sets
+that already exist). Each lives in its own module under ``commands/`` and is
+discovered by name, so adding a fourth means adding a module and one line in
+:func:`build_parser`, not restructuring this one.
 
 Model weights are never bundled (see ``docs/ARCHITECTURE.md``). They are
 resolved from ``--weights`` or ``$LAMP_DESIGN_WEIGHTS`` by
@@ -117,109 +117,9 @@ def resolve_weights(
     return path
 
 
-# ---------------------------------------------------------------------------
-# Stubs for the commands other stages still own
-# ---------------------------------------------------------------------------
-
-
-def _stub_runner(command: str, summary: str):
-    """A ``run`` that reports the weights state, then refuses to pretend."""
-
-    def run(args):
-        # Resolution is wired here so the surface is real and exercised; it is
-        # non-fatal in a stub because "not implemented" is the honest blocker.
-        found = resolve_weights(getattr(args, "weights", None), required=False)
-        weights = (
-            f"Weights resolve to {found}."
-            if found
-            else f"Weights are not configured yet either: pass --weights or set "
-                 f"{WEIGHTS_ENV_VAR}."
-        )
-        raise NotImplementedError(
-            f"`lamp-design {command}` is not implemented yet: {summary} The command "
-            f"surface above is final, so scripts can be written against it. {weights}"
-        )
-
-    return run
-
-
-def _register_design_stub(subparsers) -> None:
-    parser = subparsers.add_parser(
-        "design",
-        help="Run the full design pipeline (not implemented yet)",
-        description="""
-Generate candidate eight-primer LAMP sets across the target, score every
-candidate against every target sequence with the trained ensemble, and return
-the top N positionally-diverse sets.
-
-NOT IMPLEMENTED YET -- registered so the command surface is visible.
-""",
-    )
-    parser.add_argument(
-        "--in", dest="input", required=True,
-        help="Input FASTA, or a panel JSON from `lamp-design prepare`",
-    )
-    parser.add_argument("--out", dest="output", required=True, help="Output report path")
-    parser.add_argument(
-        "--top", type=int, default=20,
-        help="Number of positionally-diverse sets to return (default: %(default)s)",
-    )
-    add_weights_argument(parser)
-    parser.set_defaults(
-        func=_stub_runner(
-            "design",
-            "candidate generation, thermo features, encoding and inference are owned "
-            "by the other pipeline stages.",
-        )
-    )
-
-
-def _register_evaluate_stub(subparsers) -> None:
-    parser = subparsers.add_parser(
-        "evaluate",
-        help="Score a user-supplied primer set (not implemented yet)",
-        description="""
-Score primer sets the user already has against a target panel, instead of
-designing new ones: the same thermo + encoding + inference path as `design`,
-without candidate generation.
-
-NOT IMPLEMENTED YET -- registered so the command surface is visible.
-""",
-    )
-    parser.add_argument(
-        "--in", dest="input", required=True,
-        help="Primer sets to score (eight primers per set)",
-    )
-    parser.add_argument(
-        "--targets", required=True,
-        help="Target FASTA, or a panel JSON from `lamp-design prepare`",
-    )
-    parser.add_argument("--out", dest="output", required=True, help="Output report path")
-    add_weights_argument(parser)
-    parser.set_defaults(
-        func=_stub_runner(
-            "evaluate",
-            "it shares the thermo, encoding and inference stages, which are owned by "
-            "the other agents.",
-        )
-    )
-
-
-def _register_command(subparsers, name: str, fallback=None) -> None:
-    """Register ``lamp_design.commands.<name>``, falling back to a stub.
-
-    The fallback is used only when that command module itself is missing -- a
-    missing *dependency* inside an existing module still raises, so a broken
-    import never hides behind a stub.
-    """
-    module_path = f"lamp_design.commands.{name}"
-    try:
-        module = importlib.import_module(module_path)
-    except ModuleNotFoundError as exc:
-        if fallback is None or getattr(exc, "name", None) != module_path:
-            raise
-        fallback(subparsers)
-        return
+def _register_command(subparsers, name: str) -> None:
+    """Register ``lamp_design.commands.<name>``'s subcommand."""
+    module = importlib.import_module(f"lamp_design.commands.{name}")
     module.register(subparsers)
 
 
@@ -256,12 +156,8 @@ For more information on a specific command:
         metavar="<command>",
     )
 
-    # Import and register subcommands.
-    from lamp_design.commands import prepare
-
-    prepare.register(subparsers)
-    _register_command(subparsers, "design", fallback=_register_design_stub)
-    _register_command(subparsers, "evaluate", fallback=_register_evaluate_stub)
+    for name in ("prepare", "design", "evaluate"):
+        _register_command(subparsers, name)
 
     return parser
 
