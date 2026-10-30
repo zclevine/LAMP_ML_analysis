@@ -363,38 +363,62 @@ def _read_primer_fasta(text: str, check: PrimerSetCheck) -> None:
             check.sets.append((set_id, normalised))
 
 
+def _find_column(columns: dict[str, int], aliases: tuple[str, ...]) -> str | None:
+    """First alias the header actually has, mirroring ``evaluate._pick``."""
+    for alias in aliases:
+        if alias in columns:
+            return alias
+    return None
+
+
 def _read_primer_table(text: str, check: PrimerSetCheck) -> None:
-    """TSV/CSV with a name column and one column per primer type."""
+    """CSV/TSV with one column per primer, as ``evaluate.load_rows`` reads it."""
     rows = [line for line in text.splitlines() if line.strip()]
     if len(rows) < 2:
         check.errors.append(
-            "A primer table needs a header row naming the primer types and at least "
-            f"one set. Expected columns: set_id, {', '.join(PRIMER_TYPE_ORDER)}."
+            "A primer table needs a header row and at least one data row. Expected "
+            f"one column per primer named 'F3' or 'F3_sequence', for all of "
+            f"{', '.join(PRIMER_TYPE_ORDER)}."
         )
         return
 
     header = _split_table_row(rows[0])
-    columns = {cell.strip().upper(): position for position, cell in enumerate(header)}
-    name_column = next(
-        (columns[key] for key in ("SET_ID", "SET", "NAME", "ID", "PRIMER_SET") if key in columns),
-        None,
-    )
-    type_columns = {t: columns.get(t.upper()) for t in PRIMER_TYPE_ORDER}
+    columns = {cell.strip().lower(): position for position, cell in enumerate(header)}
+    type_columns: dict[str, int | None] = {}
+    for primer_type in PRIMER_TYPE_ORDER:
+        lowered = primer_type.lower()
+        type_columns[primer_type] = columns.get(f"{lowered}_sequence", columns.get(lowered))
     absent = [t for t, position in type_columns.items() if position is None]
     if absent:
         check.errors.append(
-            f"The header is missing a column for {', '.join(absent)}. Expected one "
-            f"column per primer type: {', '.join(PRIMER_TYPE_ORDER)}"
-            + (", plus a set_id column." if name_column is None else ".")
+            f"The header is missing a sequence column for {', '.join(absent)}. "
+            "Expected one column per primer named e.g. 'F3_sequence' or 'F3', for all "
+            f"of {', '.join(PRIMER_TYPE_ORDER)}. Found: {', '.join(header[:12])}"
+            + (" ..." if len(header) > 12 else "")
         )
         return
 
+    for role, aliases in (
+        ("set name", SET_NAME_COLUMNS),
+        ("target name", TARGET_NAME_COLUMNS),
+        ("master mix", MASTER_MIX_COLUMNS),
+        ("concentration", CONC_COLUMNS),
+        ("measured Tp", TRUTH_COLUMNS),
+    ):
+        found = _find_column(columns, aliases)
+        if found:
+            check.optional_columns[role] = found
+    check.has_window_columns = all(
+        f"{t.lower()}_target_sequence" in columns for t in PRIMER_TYPE_ORDER
+    )
+
+    name_column = columns.get(check.optional_columns.get("set name", ""))
     for index, line in enumerate(rows[1:], start=1):
         cells = _split_table_row(line)
         label = (
             cells[name_column].strip()
             if name_column is not None and name_column < len(cells) and cells[name_column].strip()
-            else f"set_{index}"
+            else f"row_{index}"
         )
         primers = {
             primer_type: (cells[position] if position is not None and position < len(cells) else "")
@@ -405,15 +429,17 @@ def _read_primer_table(text: str, check: PrimerSetCheck) -> None:
             check.sets.append((label, normalised))
 
 
-def primer_sets_to_fasta(sets: list[tuple[str, dict[str, str]]]) -> str:
-    """Render parsed sets back as ``>set_id_<type>`` FASTA.
+def primer_sets_to_csv(sets: list[tuple[str, dict[str, str]]]) -> str:
+    """Render parsed sets as the CSV ``lamp-design evaluate --in`` reads.
 
-    Used when the sets were typed into the page rather than uploaded, so the
-    engine is always handed a file in one shape.
+    Used when the sets came in as FASTA, so the engine is always handed its own
+    documented input shape rather than a second format it would have to learn.
+    The target windows are deliberately not included: with none present the
+    engine locates them in ``--targets`` by best Hamming match, which is what
+    the Target step supplied.
     """
-    lines: list[str] = []
+    header = ["primer_set", *PRIMER_TYPE_ORDER]
+    lines = [",".join(header)]
     for set_id, primers in sets:
-        for primer_type in PRIMER_TYPE_ORDER:
-            lines.append(f">{set_id}_{primer_type}")
-            lines.append(primers[primer_type])
+        lines.append(",".join([set_id, *(primers[t] for t in PRIMER_TYPE_ORDER)]))
     return "\n".join(lines) + "\n"

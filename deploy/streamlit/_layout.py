@@ -16,13 +16,17 @@ import streamlit as st
 
 import _backend
 from _engine_api import (
+    DEFAULT_CENSOR_MINUTES,
     DEFAULT_CONCENTRATIONS,
     DEFAULT_MASTER_MIXES,
+    DEFAULT_MAX_WINDOW_MISMATCHES,
     DEFAULT_MIN_SEPARATION,
     DEFAULT_N_SETS,
     DEFAULT_STRIDE,
     DEFAULT_TP_THRESHOLD,
     MASTER_MIX_LABELS,
+    MAX_BUDGET,
+    MAX_SEQUENCES,
     MIN_TARGET_LENGTH,
     n_available_geometries,
     resolved_device,
@@ -64,6 +68,10 @@ DEFAULT_PARAMS: dict[str, Any] = {
     "pre_aligned": False,
     "device": "auto",
     "threads": 0,
+    # Evaluate only.
+    "use_input_conditions": False,
+    "max_window_mismatches": DEFAULT_MAX_WINDOW_MISMATCHES,
+    "censor_at": DEFAULT_CENSOR_MINUTES,
 }
 
 #: Widget keys bound to the parameter dict. Streamlit's widget state outlives a
@@ -469,23 +477,10 @@ def preflight_checks() -> tuple[list[str], list[str]]:
 def render_input_limits() -> None:
     """The caps, stated where the user is about to run into them."""
     st.caption(
-        f"Limits: up to {MAX_UPLOAD_MB:g} MB per upload, "
-        f"1-{_backend_max_sequences()} sequences, "
-        f"n_sequences x longest ≤ {_backend_max_budget():,}, "
-        f"each sequence ≥ {MIN_TARGET_LENGTH} nt, A/C/G/T only."
+        f"Limits: up to {MAX_UPLOAD_MB:g} MB per upload, 1-{MAX_SEQUENCES} sequences, "
+        f"n_sequences x longest ≤ {MAX_BUDGET:,}, each sequence ≥ {MIN_TARGET_LENGTH} nt, "
+        "A/C/G/T only."
     )
-
-
-def _backend_max_sequences() -> int:
-    from _engine_api import MAX_SEQUENCES
-
-    return MAX_SEQUENCES
-
-
-def _backend_max_budget() -> int:
-    from _engine_api import MAX_BUDGET
-
-    return MAX_BUDGET
 
 
 def master_mix_label(key: str) -> str:

@@ -42,6 +42,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import signal
 import subprocess
 import sys
@@ -50,18 +51,27 @@ import time
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Iterable
+from typing import Any, Callable, Iterable, Optional
 
-from _engine_api import MAX_BUDGET, MAX_CANDIDATE_SETS, engine, has_engine
+from _engine_api import (
+    MAX_BUDGET,
+    MAX_CANDIDATE_SETS,
+    engine,
+    engine_default,
+    has_engine,
+)
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 APP_DIR = Path(__file__).resolve().parent
 
-#: Where run outputs are persisted. Local disk, which is **ephemeral on Cloud
+#: Root for persisted run outputs. Local disk, which is **ephemeral on Cloud
 #: Run** -- lost on redeploy and on scale events, and invisible to a second
 #: instance. This variable is the seam for a mounted volume or a GCS-backed
-#: path later, the same role ``PRIMERCAST_DATA_DIR`` plays in PrimerCast.
-DATA_DIR = Path(os.environ.get("LAMP_DESIGN_DATA_DIR") or (REPO_ROOT / "runs"))
+#: path later, the same role ``PRIMERCAST_DATA_DIR`` plays in PrimerCast, where
+#: it likewise defaults to the project root and runs land in ``<root>/runs``.
+#: (An earlier revision defaulted it to ``<repo>/runs``, which put every run in
+#: ``<repo>/runs/runs/<id>``.)
+DATA_DIR = Path(os.environ.get("LAMP_DESIGN_DATA_DIR") or REPO_ROOT)
 RUNS_DIR = DATA_DIR / "runs"
 
 ENVELOPE_SCHEMA = "lamp-design/modal-result@1"
@@ -85,12 +95,21 @@ DESIGN_STAGES: tuple[tuple[str, str], ...] = (
     ("report", "Ranking and diversity selection"),
 )
 
-#: Evaluate skips generation; its stages are whatever `lamp_design.commands.
-#: evaluate` reports, so only the two this app itself drives are listed.
+#: Evaluate skips generation. Only ``prepare`` is this app's own; the rest are
+#: the stages ``commands/evaluate.py``'s ``run`` prints, picked up out of the
+#: run log by `stages_from_log` -- that CLI entry point owns its own progress
+#: callback, and reimplementing its orchestration to get one of ours would be
+#: the duplication `commands/design.py` warns against.
 EVALUATE_STAGES: tuple[tuple[str, str], ...] = (
-    ("prepare", "Preparing the target panel"),
-    ("evaluate", "Scoring the supplied primer sets"),
+    ("prepare", "Reading the primer sets and target"),
+    ("thermo", "Thermodynamic features"),
+    ("inference", "Scoring with the Lyra ensemble"),
+    ("report", "Predictions and agreement metrics"),
 )
+
+#: ``cli`` stage lines look like ``"  thermo     1,234 unique pairs"``: two
+#: spaces, a stage name, whitespace, the message.
+_LOG_STAGE = re.compile(r"^ {2}(\w+)\s{2,}(\S.*)$")
 
 ProgressFn = Callable[[str, str], None]
 
@@ -214,7 +233,7 @@ def build_design_request(
     min_separation: int,
     pre_aligned: bool,
     device: str,
-    threads: int,
+    threads: Optional[int],
 ) -> dict:
     """A design request, in the shape both backends accept.
 
@@ -239,7 +258,8 @@ def build_design_request(
         "min_separation": int(min_separation),
         "pre_aligned": bool(pre_aligned),
         "device": device,
-        "threads": int(threads),
+        # None is the engine's documented "all cores", so it has to survive.
+        "threads": None if threads is None else int(threads),
     }
 
 
@@ -256,9 +276,19 @@ def build_evaluate_request(
     tp_threshold_minutes: float,
     pre_aligned: bool,
     device: str,
-    threads: int,
+    threads: Optional[int],
+    use_input_conditions: bool = False,
+    max_window_mismatches: int = 6,
+    censor_at: float = 60.0,
+    truth_column: str = "",
+    windows: str = "auto",
 ) -> dict:
-    """An evaluate request: the user's own primer sets, scored against a panel."""
+    """An evaluate request: the user's own primer sets, scored against a panel.
+
+    ``pre_aligned`` is carried for symmetry and for the run config; evaluate
+    locates each primer's window in each target directly and never builds a
+    consensus, so it has no alignment step to switch.
+    """
     return {
         "run_id": run_id,
         "workflow": "evaluate",
@@ -271,7 +301,13 @@ def build_evaluate_request(
         "tp_threshold_minutes": float(tp_threshold_minutes),
         "pre_aligned": bool(pre_aligned),
         "device": device,
-        "threads": int(threads),
+        # None is the engine's documented "all cores", so it has to survive.
+        "threads": None if threads is None else int(threads),
+        "use_input_conditions": bool(use_input_conditions),
+        "max_window_mismatches": int(max_window_mismatches),
+        "censor_at": float(censor_at),
+        "truth_column": truth_column,
+        "windows": windows,
     }
 
 
@@ -344,6 +380,30 @@ def read_envelope(run_id: str) -> dict | None:
         return json.loads(path.read_text())
     except (json.JSONDecodeError, OSError):
         return None
+
+
+def stages_from_log(run_id: str, stage_keys: Iterable[str]) -> dict[str, str]:
+    """Engine stage lines scraped out of the run log, ``{stage: message}``.
+
+    PrimerCast drives its progress display by parsing Snakemake's stdout for
+    ``rule`` lines; this is the same trick for the one entry point whose
+    progress this app cannot receive directly. Only used to fill gaps the
+    ``progress`` callback left, so a stage never appears twice.
+    """
+    wanted = set(stage_keys)
+    found: dict[str, str] = {}
+    path = log_path(run_id)
+    if not path.exists():
+        return found
+    try:
+        text = path.read_text(errors="replace")
+    except OSError:
+        return found
+    for line in text.splitlines():
+        match = _LOG_STAGE.match(line)
+        if match and match.group(1) in wanted:
+            found[match.group(1)] = match.group(2).strip()
+    return found
 
 
 def read_log(run_id: str, *, max_lines: int = 200) -> str:
@@ -475,96 +535,106 @@ def run_local(request: dict, paths: RunPaths, progress: ProgressFn | None = None
     return _envelope(request, payload, timing)
 
 
+#: Payload schema for an evaluate run. Deliberately NOT
+#: ``lamp-design/result@1``: ``EvaluationResult`` is per-row predictions plus
+#: agreement metrics, not ranked sets with a panel, and dressing it up as the
+#: design payload would make the Results page lie about what it is showing.
+EVALUATE_PAYLOAD_SCHEMA = "lamp-design/evaluate-result@1"
+
+
 def evaluate_local(request: dict, paths: RunPaths, progress: ProgressFn | None = None) -> dict:
-    """Score user-supplied primer sets against a panel. Returns the envelope.
+    """Score user-supplied primer sets against a target FASTA. Returns the envelope.
 
-    WIRING POINT. ``lamp_design.commands.evaluate`` does not exist yet -- it is
-    being written as this is -- so the call below is made through the same
-    dotted-name indirection as everything else and fails with the exact name it
-    wanted. It is shaped against the CLI surface in ``cli.py``, which that
-    module's docstring calls final: ``--in`` (the primer sets), ``--targets``
-    (FASTA or panel JSON), ``--out`` (a path prefix) and ``--weights``, with
-    argparse dests ``input`` / ``targets`` / ``output`` / ``weights``. Each
-    command module in this engine exposes ``register(subparsers)`` and
-    ``run(args)``, so a Namespace is the shape most likely to match on arrival.
+    One call into the engine's own CLI entry point, built against the surface in
+    ``commands/evaluate.py``: ``--in`` is a CSV with one column per primer,
+    ``--targets`` is the FASTA its windows are located in, ``--out`` is a path
+    prefix, and ``run(args)`` does the orchestration. Going through ``run``
+    rather than ``evaluate()`` is deliberate -- row loading, window location and
+    output writing are sequenced there once, and a second copy here would drift
+    from the CLI exactly as ``commands/design.py`` warns.
 
-    If it does not, the error names the signature that was actually found, and
-    adapting is a change to this one call.
+    It is resolved by dotted name like everything else, so a build without that
+    module fails with the name it wanted instead of an ImportError at app start.
     """
     say = progress or (lambda stage, message: None)
     run = engine("evaluate_run")
 
     targets_fasta = paths.work_dir / "targets.fasta"
     targets_fasta.write_text(request["fasta"])
-    primers_in = paths.work_dir / (request.get("primer_sets_filename") or "primer_sets.fasta")
+    primers_in = paths.work_dir / (request.get("primer_sets_filename") or "primer_sets.csv")
     primers_in.write_text(request["primer_sets_text"])
     out_prefix = paths.out_dir / "result"
-    say("prepare", f"wrote {primers_in.name} and {targets_fasta.name}")
 
-    started = time.time()
+    # A single master mix / concentration overrides each row's own condition; two
+    # or more make a cross product. Passing neither keeps whatever the input
+    # file said, which is what `use_input_conditions` asks for.
+    if request.get("use_input_conditions"):
+        master_mixes: list[str] | None = None
+        concentrations: list[float] | None = None
+    else:
+        master_mixes = sorted({c["master_mix"] for c in request["conditions"]})
+        concentrations = sorted({float(c["target_conc"]) for c in request["conditions"]})
+    say(
+        "prepare",
+        f"{primers_in.name} against {targets_fasta.name}, "
+        + ("conditions from the input file" if master_mixes is None
+           else f"{len(master_mixes) * len(concentrations)} condition(s)"),
+    )
+
     import argparse
-    import inspect
 
     args = argparse.Namespace(
         input=str(primers_in),
         targets=str(targets_fasta),
         output=str(out_prefix),
         weights=_weights(),
-        tp_threshold=request["tp_threshold_minutes"],
-        master_mixes=[c["master_mix"] for c in request["conditions"]],
-        concentrations=[c["target_conc"] for c in request["conditions"]],
-        rank_master_mix=request["master_mix"],
-        rank_conc=request["target_conc"],
+        windows=request.get("windows", "auto"),
+        max_window_mismatches=int(request["max_window_mismatches"]),
+        master_mixes=master_mixes,
+        concentrations=concentrations,
+        truth_column=request.get("truth_column") or None,
+        censor_at=float(request["censor_at"]),
+        tp_threshold=float(request["tp_threshold_minutes"]),
         device=request.get("device", "auto"),
-        threads=request.get("threads") or None,
-        pre_aligned=request["pre_aligned"],
-        max_budget=MAX_BUDGET,
         batch_size=None,
+        pair_chunk=int(engine_default("lamp_design.types", "PAIR_CHUNK", 20_000)),
+        threads=request.get("threads") or None,
     )
-    try:
-        result = run(args)
-    except TypeError as exc:
-        try:
-            signature = str(inspect.signature(run))
-        except (TypeError, ValueError):
-            signature = "<unavailable>"
-        raise NotImplementedError(
-            f"`lamp-design evaluate` resolved to {getattr(run, '__module__', '?')}."
-            f"{getattr(run, '__qualname__', '?')}{signature}, which did not accept the "
-            f"argparse Namespace this app passes ({exc}). Adapt the single call in "
-            "_backend.evaluate_local to that signature."
-        ) from exc
-    timing = {"evaluate_s": time.time() - started}
-    timing["total"] = timing["evaluate_s"]
-    say("evaluate", "scoring finished")
+    started = time.time()
+    result = run(args)
+    timing = {"evaluate_s": time.time() - started, "total": time.time() - started}
 
-    payload = _evaluate_payload(result, request, out_prefix)
+    payload = _evaluate_payload(result, out_prefix)
+    say("report", f"{payload['n_scored']:,} row(s) scored")
     return _envelope(request, payload, timing)
 
 
-def _evaluate_payload(result: Any, request: dict, out_prefix: Path) -> dict:
-    """Turn whatever evaluate returned into a ``result_to_dict`` payload.
+def _evaluate_payload(result: Any, out_prefix: Path) -> dict:
+    """``EvaluationResult`` -> JSON-ready payload, via the files it just wrote.
 
-    Three shapes are tolerated, in descending order of preference, because the
-    return type is not fixed yet: a ``DesignResult`` (serialise it with the
-    engine's own writer), a dict (assume it already is the payload), or nothing
-    at all (read the ``.json`` the CLI surface promises ``--out`` writes).
+    The per-row table is read back from ``<prefix>.predictions.csv`` rather than
+    reaching into ``EvaluationResult.rows``: that CSV and its columns are the
+    documented ``--out`` surface, so the UI depends on the contract rather than
+    on the dataclass's internals.
     """
-    if hasattr(result, "scored_sets"):
-        _, ranking = _conditions(request)
-        return engine("result_to_dict")(
-            result, ranking_condition=ranking, tp_threshold=request["tp_threshold_minutes"]
-        )
-    if isinstance(result, dict):
-        return result
-    written = Path(f"{out_prefix}.json")
-    if written.exists():
-        return json.loads(written.read_text())
-    raise NotImplementedError(
-        f"`lamp-design evaluate` returned {type(result).__name__} and wrote no "
-        f"{written.name}, so there is no result to render. Adapt _backend."
-        "_evaluate_payload to whatever it does produce."
-    )
+    predictions: list[dict[str, Any]] = []
+    csv_path = Path(f"{out_prefix}.predictions.csv")
+    if csv_path.exists():
+        import csv as csv_module
+
+        with open(csv_path, newline="") as handle:
+            predictions = [dict(row) for row in csv_module.DictReader(handle)]
+
+    return {
+        "schema": EVALUATE_PAYLOAD_SCHEMA,
+        "kind": "evaluate",
+        "n_scored": int(getattr(result, "n_scored", len(predictions))),
+        "metrics": dict(getattr(result, "metrics", {}) or {}),
+        "skipped": dict(getattr(result, "skipped", {}) or {}),
+        "warnings": list(getattr(result, "warnings", []) or []),
+        "params": dict(getattr(result, "params", {}) or {}),
+        "predictions": predictions,
+    }
 
 
 def _envelope(request: dict, payload: dict, timing: dict[str, float]) -> dict:
@@ -602,7 +672,20 @@ _LOCAL_JOBS: dict[str, subprocess.Popen] = {}
 
 
 def start_run(request: dict, *, backend: str) -> dict:
-    """Submit a run and return the job handle. Does not block."""
+    """Submit a run and return the job handle. Does not block.
+
+    ``request["run_id"]`` must already be set, by :func:`new_run_id` -- it is
+    never user-supplied, and it names the directory the run writes into. This
+    is checked rather than defaulted: minting one here would silently give a
+    caller that forgot a second, unrelated run directory, which is worse than
+    being told.
+    """
+    if not request.get("run_id"):
+        raise ValueError(
+            "request['run_id'] is required; mint one with _backend.new_run_id() "
+            "before calling start_run (it names the run's output directory and "
+            "is never taken from user input)"
+        )
     if backend == "local":
         return _start_local(request)
     return _start_modal(request, backend)

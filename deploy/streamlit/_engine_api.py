@@ -2,11 +2,12 @@
 
 Why a table of dotted names rather than plain imports: the front end integrates
 against ``lamp_design``'s public surface, which loads lazily, and one entry
-point (``evaluate``) is still being written by another agent. Resolving at the
-call site means a missing name fails with the exact name it wanted instead of
-an ImportError at app start, so the Evaluate page can degrade on its own while
-the rest of the app keeps working. Keep this table in step with ``ENGINE_API``
-in ``../modal/app.py``, which documents each signature.
+point (``evaluate``) landed only recently. Resolving at the call site means a
+missing name fails with the exact name it wanted instead of an ImportError at
+app start, so one page can degrade on its own while the rest of the app keeps
+working. ``ENGINE_API`` in ``../modal/app.py`` is the same idea and documents
+each signature; it carries more names because its fan-out drives the stages
+individually, while this app makes one orchestration call per run.
 
 Every widget bound in the UI is derived from a constant read back out of the
 engine here, so the two cannot drift into disagreement about what is accepted.
@@ -35,22 +36,14 @@ ENGINE_API: dict[str, tuple[str, str]] = {
         "lamp_design.count_candidate_slots",
         "lamp_design.generation.count_candidate_slots",
     ),
-    "generate_candidates": (
-        "lamp_design.generate_candidates",
-        "lamp_design.generation.generate_candidates",
-    ),
-    "build_design_result": (
-        "lamp_design.build_design_result",
-        "lamp_design.report.build_design_result",
-    ),
     "result_to_dict": ("lamp_design.result_to_dict", "lamp_design.report.result_to_dict"),
     "write_outputs": ("lamp_design.write_outputs", "lamp_design.report.write_outputs"),
-    "compute_thermo": ("lamp_design.compute_thermo", "lamp_design.thermo.compute_thermo"),
-    "predict_tp": ("lamp_design.predict_tp", "lamp_design.models.bridge.predict_tp"),
     # The orchestration entry point a design run goes through. One call, so the
-    # app and the CLI cannot drift in what "a design run" means.
+    # app and the CLI cannot drift in what "a design run" means -- which is why
+    # the stage-level names (generate_candidates, compute_thermo, predict_tp,
+    # build_design_result) are NOT in this table. The Modal harness carries them
+    # because its fan-out interleaves the stages; nothing here does.
     "design": ("lamp_design.design", "lamp_design.commands.design.design"),
-    "build_conditions": ("lamp_design.build_conditions", "lamp_design.commands.design.build_conditions"),
     "resolve_device": ("lamp_design.resolve_device", "lamp_design.commands.design.resolve_device"),
     # Torch-free first: `cli.resolve_weights` is the one place the weights
     # policy lives, and preflight runs on every rerun, so it must not pay for
@@ -128,6 +121,18 @@ DEFAULT_TP_THRESHOLD = float(
 )
 DEFAULT_N_SETS = int(engine_default("lamp_design.report", "DEFAULT_N_SETS", 20))
 DEFAULT_MIN_SEPARATION = int(engine_default("lamp_design.report", "DEFAULT_MIN_SEPARATION_BP", 30))
+
+#: Evaluate's own bounds. ``censor_at`` is the Tp assigned to a reaction that
+#: never amplified, matching the training data's ``tp60_censored`` convention;
+#: ``max_window_mismatches`` rejects a located binding site worse than this,
+#: because past it the placement is more likely to be the wrong site than a
+#: diverged one.
+DEFAULT_CENSOR_MINUTES = float(
+    engine_default("lamp_design.commands.evaluate", "DEFAULT_CENSOR_MINUTES", 60.0)
+)
+DEFAULT_MAX_WINDOW_MISMATCHES = int(
+    engine_default("lamp_design.commands.evaluate", "DEFAULT_MAX_WINDOW_MISMATCHES", 6)
+)
 
 #: The engine's stride default is 1 (every anchor). That is the right default
 #: for a CLI run with a budget; for an interactive page it is minutes of wait on

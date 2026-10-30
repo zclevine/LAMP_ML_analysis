@@ -22,6 +22,7 @@ from lamp_design.commands.design import (
     load_input_panel,
     resolve_device,
 )
+from lamp_design.generation import default_geometries
 from lamp_design.commands.prepare import InputError
 from lamp_design.types import Condition
 
@@ -162,6 +163,11 @@ def test_design_records_its_own_parameters(tmp_path):
     assert p["n_candidates"] > 0
     assert p["n_predictions"] == p["n_pairs"] * len(conds)
     assert set(p["timings_s"]) >= {"generation_s", "thermo_s", "inference_s", "report_s"}
+    # Geometry *ids*, not dataclass reprs. This regressed once: Geometry has
+    # no `name`, so a `getattr(g, "name", str(g))` here wrote the whole repr
+    # into every report -- readable, so nothing failed, but useless as a label.
+    assert p["geometries"] == [g.geometry_id for g in default_geometries()]
+    assert all("Geometry(" not in g for g in p["geometries"])
     # JSON-serializable by construction -- it gets written to the report.
     json.dumps(p)
 

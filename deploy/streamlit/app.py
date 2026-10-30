@@ -72,7 +72,7 @@ from _validation import (  # noqa: E402
     MAX_PRIMER_SETS,
     MAX_UPLOAD_BYTES,
     MAX_UPLOAD_MB,
-    primer_sets_to_fasta,
+    primer_sets_to_csv,
 )
 
 #: How often the Run page re-reads a live run's status file. Short enough that
@@ -342,30 +342,38 @@ def _page_primer_sets() -> None:
         )
 
     st.markdown(
-        "Paste or upload the sets you want scored. A LAMP set is all eight primers: "
-        f"**{', '.join(PRIMER_TYPE_ORDER)}**, in the frozen layout order along the "
-        "target. Forward-strand types are `F3, F2, B1c, BL`; the rest are stored "
-        "reverse-complemented, which is how the engine expects them."
+        "Which sets should be scored? A LAMP set is all eight primers — "
+        f"**{', '.join(PRIMER_TYPE_ORDER)}** — in the frozen layout order along the "
+        "target. Forward-strand types are `F3, F2, B1c, BL`; the rest are supplied "
+        "reverse-complemented, which is the orientation the model sees."
     )
     st.caption(
-        f"Up to {MAX_PRIMER_SETS} sets. Two shapes are accepted: FASTA with headers "
-        "`<set_name>_<type>`, or a TSV/CSV with a `set_id` column plus one column per "
-        "primer type. A/C/G/T only — degenerate primers are rejected rather than "
-        "expanded."
+        f"Up to {MAX_PRIMER_SETS} sets, A/C/G/T only — degenerate primers are rejected "
+        "rather than expanded. Each primer's binding site is located in the target "
+        "sequences from the previous step by best Hamming match."
     )
     st.divider()
 
     source = st.radio(
         "Input method",
-        ["Paste primer sets", "Upload a file"],
+        ["Upload a table", "Paste primers"],
         key="primer_source",
         horizontal=True,
         label_visibility="collapsed",
     )
-    if source == "Upload a file":
+    if source == "Upload a table":
+        st.caption(
+            "A CSV or TSV with one column per primer, named `F3_sequence` or `F3`. "
+            "Optional columns are used when present: `primer_set` and `target_seq` for "
+            "names, `master_mix` and `target_conc` for the condition each row is scored "
+            "under, `<type>_target_sequence` for windows that are already known, and "
+            "**`tp` for a measured Tp — which turns the run into a validation** and "
+            "reports Spearman, MAE and ROC-AUC against it. The file is passed to the "
+            "engine unchanged, so every one of those keeps working."
+        )
         uploaded = st.file_uploader(
             "Primer sets",
-            type=["fa", "fasta", "tsv", "csv", "txt"],
+            type=["csv", "tsv", "tab", "txt"],
             accept_multiple_files=False,
             key="primer_upload",
         )
@@ -376,6 +384,11 @@ def _page_primer_sets() -> None:
         elif not st.session_state.get("primer_sets_text"):
             st.session_state["primer_sets_text"] = ""
     else:
+        st.caption(
+            "FASTA with one record per primer, headed `<set_name>_<type>`. This is "
+            "converted to the engine's CSV input for you. For measured Tp or "
+            "per-row conditions, upload a table instead."
+        )
         if "primer_paste" not in st.session_state:
             st.session_state["primer_paste"] = st.session_state.get("primer_sets_text", "")
         pasted = st.text_area(
@@ -385,7 +398,7 @@ def _page_primer_sets() -> None:
             placeholder=">set1_F3\nACGT...\n>set1_F2\nACGT...",
         )
         st.session_state["primer_sets_text"] = (pasted or "").strip()
-        st.session_state["primer_sets_filename"] = "primer_sets.fasta"
+        st.session_state["primer_sets_filename"] = "primer_sets.csv"
 
     check = _layout.primer_set_check()
     if check is not None:
@@ -395,16 +408,32 @@ def _page_primer_sets() -> None:
             st.warning(message)
         if check.ok:
             st.success(
-                f"{check.n_sets} set(s) read as {check.source_format}, "
+                f"{check.n_sets} row(s) read as {check.source_format}, "
                 f"{check.n_sets * len(PRIMER_TYPE_ORDER)} primers in total."
             )
-            with st.expander("Primers as the engine will see them"):
-                st.code(
-                    primer_sets_to_fasta(check.sets[:5]),
-                    language="text",
+            if check.optional_columns:
+                st.info(
+                    "Optional columns found: "
+                    + ", ".join(
+                        f"**{role}** (`{column}`)"
+                        for role, column in check.optional_columns.items()
+                    )
+                    + (
+                        ". A measured-Tp column means this run also reports agreement "
+                        "metrics."
+                        if "measured Tp" in check.optional_columns
+                        else "."
+                    )
                 )
+            if check.has_window_columns:
+                st.info(
+                    "The table carries `<type>_target_sequence` columns, so the engine "
+                    "uses those windows instead of locating them."
+                )
+            with st.expander("Primers as the engine will read them"):
+                st.code(primer_sets_to_csv(check.sets[:5]), language="text")
                 if check.n_sets > 5:
-                    st.caption(f"First 5 of {check.n_sets} sets shown.")
+                    st.caption(f"First 5 of {check.n_sets} rows shown.")
 
     st.divider()
     _layout.render_step_nav(
@@ -435,6 +464,10 @@ def _estimate(params: dict) -> dict[str, float | int] | None:
     if _layout.workflow() == "evaluate":
         primer_check = _layout.primer_set_check()
         candidates = primer_check.n_sets if primer_check and primer_check.ok else 0
+        # Each input row is expanded to one row per target sequence, and either
+        # keeps its own condition or is re-scored under every one in the sweep.
+        if params["use_input_conditions"]:
+            conditions = 1
     else:
         anchors = max(0, (check.max_len - MIN_TARGET_LENGTH) // params["stride"] + 1)
         candidates = min(anchors * params["n_geometries"], MAX_CANDIDATE_SETS)
@@ -496,6 +529,34 @@ def _page_parameters() -> None:
             "concentration, so every candidate is scored under each combination. The "
             "default sweep is the engine's: two mixes x two concentrations."
         )
+        if _layout.workflow() == "evaluate":
+            check = _layout.primer_set_check()
+            has_own = bool(check and set(check.optional_columns) & {"master mix", "concentration"})
+            params["use_input_conditions"] = (
+                st.radio(
+                    "Which conditions?",
+                    options=[False, True],
+                    index=1 if params["use_input_conditions"] and has_own else 0,
+                    format_func=lambda value: (
+                        "Each row's own condition, from the input file"
+                        if value
+                        else "Override every row with the sweep below"
+                    ),
+                    key="p_use_input_conditions",
+                    help=(
+                        "The engine's rule: one master mix and one concentration replace "
+                        "each row's own condition, two or more make a cross product, and "
+                        "neither keeps what the file says."
+                    ),
+                )
+                if has_own
+                else False
+            )
+            if not has_own:
+                st.caption(
+                    "The input carries no master-mix or concentration column, so the "
+                    "sweep below applies to every row."
+                )
         left, right = st.columns(2)
         params["master_mixes"] = left.multiselect(
             "Master mixes",
@@ -615,17 +676,49 @@ def _page_parameters() -> None:
 
     with st.expander("Scoring", expanded=_layout.workflow() == "evaluate"):
         params["tp_threshold_minutes"] = st.number_input(
-            "Tp threshold for inclusivity (minutes)",
+            "Tp threshold (minutes)",
             min_value=1.0,
             max_value=240.0,
             value=float(params["tp_threshold_minutes"]),
             step=5.0,
             key="p_tp_threshold",
             help=(
-                "A set's inclusivity is the fraction of targets predicted to amplify "
-                "strictly within this time. It is a reporting threshold, not a filter."
+                "Design: a set's inclusivity is the fraction of targets predicted to "
+                "amplify strictly within this time. Evaluate: the threshold below which "
+                "a reaction counts as amplified, for the ROC-AUC. A reporting "
+                "threshold either way, never a filter."
             ),
         )
+        if _layout.workflow() == "evaluate":
+            left, right = st.columns(2)
+            params["max_window_mismatches"] = left.number_input(
+                "Maximum window mismatches",
+                min_value=0,
+                max_value=25,
+                value=int(params["max_window_mismatches"]),
+                step=1,
+                key="p_max_window_mismatches",
+                help=(
+                    "A primer whose best binding site in a target is worse than this is "
+                    "dropped rather than scored: past roughly six mismatches on a 15-25 "
+                    "nt primer the placement is more likely to be the wrong site than a "
+                    "diverged one."
+                ),
+            )
+            params["censor_at"] = right.number_input(
+                "Censor non-amplifying rows at (minutes)",
+                min_value=1.0,
+                max_value=240.0,
+                value=float(params["censor_at"]),
+                step=5.0,
+                key="p_censor_at",
+                help=(
+                    "Measured Tp assigned to a row that recorded no amplification, for "
+                    "the censored metrics. Matches the training data's tp60_censored "
+                    "convention, so those figures are comparable to the published ones. "
+                    "Only used when the input carries a measured-Tp column."
+                ),
+            )
 
     with st.expander("Compute"):
         st.caption(
@@ -679,14 +772,21 @@ def _page_parameters() -> None:
 # ---------------------------------------------------------------------------
 
 
-def _stage_checklist(status: dict, stages: tuple[tuple[str, str], ...]) -> str:
+def _stage_checklist(
+    status: dict,
+    stages: tuple[tuple[str, str], ...],
+    from_log: dict[str, str] | None = None,
+) -> str:
     """PrimerCast's rule list, over our pipeline stages.
 
     A stage is done once the engine's progress callback has reported it; the
     first unreported stage is the one in flight. The message the engine sent is
-    kept, because "235,130 (set, target) pairs" is the useful part.
+    kept, because "235,130 (set, target) pairs" is the useful part. ``from_log``
+    fills in stages scraped out of the run log, which is how the evaluate
+    workflow reports progress -- its CLI entry point owns its own callback.
     """
     reported = {entry["stage"]: entry for entry in status.get("stages") or []}
+    logged = from_log or {}
     running = status.get("state") in ("queued", "running")
     lines = []
     current_found = False
@@ -695,6 +795,8 @@ def _stage_checklist(status: dict, stages: tuple[tuple[str, str], ...]) -> str:
         if entry is not None:
             detail = f" — {entry['message']}" if entry.get("message") else ""
             lines.append(f"&#9989; &nbsp; {label}{detail} _({entry['elapsed_s']:.1f}s)_")
+        elif key in logged:
+            lines.append(f"&#9989; &nbsp; {label} — {logged[key]}")
         elif running and not current_found:
             current_found = True
             lines.append(f"&#8987; &nbsp; **{label}** ...")
@@ -755,14 +857,16 @@ def _page_run() -> None:
         return
 
     status = poll["status"] or {}
-    stages = (
-        _backend.DESIGN_STAGES
-        if job.get("workflow", "design") == "design"
-        else _backend.EVALUATE_STAGES
+    is_design = job.get("workflow", "design") == "design"
+    stages = _backend.DESIGN_STAGES if is_design else _backend.EVALUATE_STAGES
+    from_log = (
+        None
+        if is_design
+        else _backend.stages_from_log(job["run_id"], [key for key, _ in stages])
     )
     st.divider()
     st.markdown(f"Run `{job['run_id']}` on `{job.get('backend', 'local')}`")
-    st.markdown(_stage_checklist(status, stages), unsafe_allow_html=True)
+    st.markdown(_stage_checklist(status, stages, from_log), unsafe_allow_html=True)
 
     started = status.get("started_at") or job.get("submitted_at") or time.time()
     finished = status.get("finished_at")
@@ -784,7 +888,9 @@ def _page_run() -> None:
     elif poll["state"] == "succeeded" and poll["envelope"]:
         st.session_state["envelope"] = poll["envelope"]
         result = poll["envelope"]["result"]
-        if result.get("sets"):
+        if result.get("kind") == "evaluate":
+            st.success(f"Finished: {result.get('n_scored', 0):,} row(s) scored.")
+        elif result.get("sets"):
             st.success(f"Finished: {result['n_sets_returned']} set(s) returned.")
         else:
             st.error("Finished, but no primer sets survived the pipeline.")
@@ -835,16 +941,25 @@ def _start_run() -> None:
         )
     else:
         check = _layout.primer_set_check()
+        # A table goes to the engine verbatim, so its optional columns (measured
+        # Tp, per-row conditions, known windows) keep working; pasted FASTA is
+        # converted into the CSV `evaluate --in` documents.
+        pasted_fasta = check is not None and check.source_format == "fasta"
         request = _backend.build_evaluate_request(
             **common,
             primer_sets_text=(
-                primer_sets_to_fasta(check.sets)
-                if check and check.source_format == "table"
+                primer_sets_to_csv(check.sets)
+                if pasted_fasta
                 else st.session_state["primer_sets_text"]
             ),
-            primer_sets_filename=st.session_state.get(
-                "primer_sets_filename", "primer_sets.fasta"
+            primer_sets_filename=(
+                "primer_sets.csv"
+                if pasted_fasta
+                else st.session_state.get("primer_sets_filename", "primer_sets.csv")
             ),
+            use_input_conditions=params["use_input_conditions"],
+            max_window_mismatches=params["max_window_mismatches"],
+            censor_at=params["censor_at"],
         )
 
     _layout.clear_run_state()
@@ -898,12 +1013,10 @@ def _page_results() -> None:
         return
 
     st.caption(
-        f"Run `{envelope['run_id']}` — persisted to `{_backend.RUNS_DIR / envelope['run_id']}`."
+        f"Run `{envelope['run_id']}` — persisted to `{_backend.RUNS_DIR / envelope['run_id']}`. "
+        "That is local disk, and on Cloud Run it is lost on redeploy or a scale event."
     )
-    if _results.renderable(envelope):
-        _results.render_envelope(envelope)
-    else:
-        _results.render_unrenderable(envelope)
+    _results.render(envelope)
 
 
 # ---------------------------------------------------------------------------

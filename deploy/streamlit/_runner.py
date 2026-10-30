@@ -127,19 +127,21 @@ def main(argv: list[str]) -> int:
 
     envelope_path(run_id).write_text(json.dumps(envelope, indent=2))
     result = envelope["result"]
+    # A design run returns ranked sets; an evaluate run returns scored rows.
+    outcome = (
+        f"{result.get('n_scored', 0):,} row(s) scored"
+        if result.get("kind") == "evaluate"
+        else f"{result.get('n_sets_returned', 0)} set(s) returned"
+    )
     status.update(
         state="succeeded",
         finished_at=time.time(),
         timing_seconds=envelope.get("timing_seconds", {}),
-        n_sets_returned=result.get("n_sets_returned"),
+        outcome=outcome,
     )
     write_status(run_id, status)
     save_run_config(request, backend="local", status="succeeded")
-    print(
-        f"done in {time.time() - started:.1f}s: "
-        f"{result.get('n_sets_returned')} set(s) returned",
-        flush=True,
-    )
+    print(f"done in {time.time() - started:.1f}s: {outcome}", flush=True)
     return 0
 
 

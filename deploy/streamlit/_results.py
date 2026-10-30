@@ -16,6 +16,10 @@ from _tables import (
     INCLUSIVITY_FIELD,
     SPEED_FIELD,
     conditions_frame,
+    evaluate_matrix,
+    evaluate_metrics_frame,
+    is_evaluate,
+    predictions_frame,
     funnel_culprit,
     funnel_frame,
     primers_frame,
@@ -234,6 +238,107 @@ def _render_engine_artifacts(run_id: str) -> None:
                 )
 
 
+def render_evaluate(envelope: dict) -> None:
+    """An evaluate run: per-row predictions, a set x target matrix, metrics.
+
+    Deliberately not the design layout. ``EvaluationResult`` is rows and
+    agreement metrics, not ranked sets against a panel: there is nothing to rank
+    and no funnel, and showing one would be inventing structure the run does not
+    have.
+    """
+    run_id = envelope["run_id"]
+    result = envelope["result"]
+    timing = envelope.get("timing_seconds") or {}
+    frame = predictions_frame(result)
+
+    for message in result.get("warnings") or []:
+        st.warning(message)
+    skipped = {name: count for name, count in (result.get("skipped") or {}).items() if count}
+    if skipped:
+        st.warning(
+            "Dropped rows: "
+            + ", ".join(f"{count:,} ({reason.replace('_', ' ')})" for reason, count in skipped.items())
+            + ". A primer whose binding site cannot be placed within the mismatch "
+            "limit is dropped rather than scored against the wrong site."
+        )
+
+    columns = st.columns(4)
+    columns[0].metric("Rows scored", f"{result.get('n_scored', 0):,}")
+    columns[1].metric(
+        "Primer sets",
+        f"{frame['primer_set'].nunique():,}" if "primer_set" in frame.columns else "—",
+    )
+    columns[2].metric(
+        "Mean predicted Tp",
+        f"{frame['predicted_tp_minutes'].mean():.1f} min"
+        if "predicted_tp_minutes" in frame.columns and not frame.empty
+        else "—",
+    )
+    columns[3].metric("Runtime", f"{timing.get('total', 0):.0f} s")
+
+    params = result.get("params") or {}
+    if params.get("conditions"):
+        st.caption(
+            "Scored under "
+            + ", ".join(f"`{label}`" for label in params["conditions"])
+            + f" on `{params.get('device', '?')}`"
+            + (
+                ". Those conditions replaced whatever the input file said, so a warning "
+                "above about defaulting the master mix or concentration describes the "
+                "file, not what was run."
+                if len(params["conditions"]) > 1
+                else "."
+            )
+        )
+
+    metrics = evaluate_metrics_frame(result)
+    if metrics.empty:
+        st.caption(
+            "The input carried no measured-Tp column, so these are predictions only. "
+            "Add a `tp` column to turn the run into a validation: Spearman, MAE and "
+            "ROC-AUC against the measured values are then reported here."
+        )
+    else:
+        st.subheader("Agreement with measured Tp")
+        st.caption(
+            "`amplified` drops rows that recorded no amplification; `censored` keeps "
+            "them at the censoring value, which is the population comparable to the "
+            "published figures."
+        )
+        st.dataframe(metrics, hide_index=True)
+
+    matrix = evaluate_matrix(result)
+    tab_labels = ["Predictions"] + (["Tp by target"] if not matrix.empty else [])
+    tabs = st.tabs(tab_labels)
+    with tabs[0]:
+        st.caption(
+            "One row per (primer set, target, condition). `predicted_tp_minutes` is "
+            "minutes to amplification — lower is faster; `predicted_tp_std` is the "
+            "spread across the five ensemble seeds."
+        )
+        st.dataframe(frame, hide_index=True)
+    if not matrix.empty:
+        with tabs[1]:
+            st.caption("Mean predicted Tp per set against each target sequence.")
+            st.dataframe(matrix, hide_index=True)
+
+    with st.expander("What this run did"):
+        st.json(result.get("params") or {}, expanded=True)
+
+    st.subheader("Downloads")
+    columns = st.columns(2)
+    with columns[0]:
+        _download(
+            "Predictions (CSV)", frame, f"lamp_predictions_{run_id}.csv", f"dl-pred-{run_id}"
+        )
+    if not matrix.empty:
+        with columns[1]:
+            _download(
+                "Tp matrix (CSV)", matrix, f"lamp_eval_tp_{run_id}.csv", f"dl-evaltp-{run_id}"
+            )
+    _render_engine_artifacts(run_id)
+
+
 def render_unrenderable(envelope: dict) -> None:
     """Fallback for a payload that is not ``result_to_dict``-shaped.
 
@@ -251,5 +356,16 @@ def render_unrenderable(envelope: dict) -> None:
 
 
 def renderable(envelope: dict) -> bool:
+    """Whether `render_envelope` can lay this payload out."""
     result = envelope.get("result") or {}
     return isinstance(result, dict) and "sets" in result and "panel" in result
+
+
+def render(envelope: dict) -> None:
+    """Dispatch on what the run produced, not on which page asked."""
+    if is_evaluate(envelope):
+        render_evaluate(envelope)
+    elif renderable(envelope):
+        render_envelope(envelope)
+    else:
+        render_unrenderable(envelope)

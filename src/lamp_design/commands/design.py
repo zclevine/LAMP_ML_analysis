@@ -309,7 +309,12 @@ def design(
     result.params.update(
         {
             "stride": stride,
-            "geometries": [getattr(g, "name", str(g)) for g in geometries],
+            # `geometry_id`, not `name`: Geometry has no `name`, so a
+            # `getattr(g, "name", str(g))` here silently recorded the whole
+            # dataclass repr instead of 'canonical'.
+            "geometries": [
+                getattr(g, "geometry_id", None) or str(g) for g in geometries
+            ],
             "conditions": [str(c) for c in conditions],
             "ranking_condition": str(ranking_condition),
             "tp_threshold_minutes": tp_threshold,

@@ -160,16 +160,82 @@ def timings_frame(envelope: dict) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
+#: Columns in ``<prefix>.predictions.csv`` that are numbers, so the frame sorts
+#: and formats as numbers rather than as the strings the CSV holds.
+_EVALUATE_NUMERIC = (
+    "target_conc",
+    "predicted_tp_minutes",
+    "predicted_tp_std",
+    "measured_tp_minutes",
+    "residual_minutes",
+    "total_mismatches",
+)
+
+
+def is_evaluate(envelope: dict) -> bool:
+    return (envelope.get("result") or {}).get("kind") == "evaluate"
+
+
+def predictions_frame(result: dict) -> pd.DataFrame:
+    """``<prefix>.predictions.csv`` as a frame, with numeric columns coerced."""
+    frame = pd.DataFrame(result.get("predictions") or [])
+    for column in _EVALUATE_NUMERIC:
+        if column in frame.columns:
+            frame[column] = pd.to_numeric(frame[column], errors="coerce")
+    return frame
+
+
+def evaluate_metrics_frame(result: dict) -> pd.DataFrame:
+    """Agreement with measured Tp, one row per metric, one column per population.
+
+    ``amplified`` drops rows with no measured Tp; ``censored`` keeps them at the
+    censoring value. Both are reported because the censored figures are the ones
+    comparable to the paper, while the amplified ones cannot be inflated by the
+    model merely learning which reactions fail.
+    """
+    metrics = result.get("metrics") or {}
+    if not metrics:
+        return pd.DataFrame()
+    populations = list(metrics)
+    names: list[str] = []
+    for population in populations:
+        for name in metrics[population]:
+            if name not in names:
+                names.append(name)
+    return pd.DataFrame(
+        [
+            {"metric": name, **{p: metrics[p].get(name) for p in populations}}
+            for name in names
+        ]
+    )
+
+
+def evaluate_matrix(result: dict) -> pd.DataFrame:
+    """Rows = primer sets, columns = targets, values = mean predicted Tp.
+
+    The same orientation as the design workflow's Tp matrix, so a set that was
+    designed here and evaluated later reads the same way.
+    """
+    frame = predictions_frame(result)
+    if frame.empty or not {"primer_set", "target", "predicted_tp_minutes"} <= set(frame.columns):
+        return pd.DataFrame()
+    pivot = frame.pivot_table(
+        index="primer_set", columns="target", values="predicted_tp_minutes", aggfunc="mean"
+    )
+    return pivot.reset_index()
+
+
 _GEOMETRY_ID = re.compile(r"geometry_id='([^']+)'")
 
 
 def geometry_names(params: dict) -> list[str]:
     """Readable geometry names out of ``DesignResult.params['geometries']``.
 
-    ``design()`` records ``getattr(g, "name", str(g))`` and ``Geometry`` exposes
-    ``geometry_id`` rather than ``name``, so what lands in the result is the
-    whole dataclass repr. Pulling the id back out is a display concern and
-    belongs here rather than in the engine.
+    ``design()`` now records ``geometry_id``, so this is usually a passthrough.
+    It used to record ``getattr(g, "name", str(g))`` against a ``Geometry`` that
+    has no ``name``, which wrote the whole dataclass repr -- so the id is still
+    pulled back out of that form, to keep a ``result.json`` written before the
+    fix readable.
     """
     names = []
     for entry in params.get("geometries") or []:
