@@ -99,6 +99,47 @@ Settled with the team; don't silently revert these.
   you return one design twenty times.
 - **No consensus-only pre-screen in v1.** GPU capacity means every candidate is
   scored against every target; no approximation to validate.
+- **`pad_mode="group_by_length"` is the default.** See below; this one was
+  revisited with measurements rather than settled by argument.
+
+### Padding: why not reproduce the training `collate_fn`
+
+The training `collate_fn` zero-pads each batch to its longest member, and
+`Lyra.forward` mean-pools over the result **without a mask**. So a sequence's
+prediction depends on which other sequences happened to share its batch — by
+up to 3 minutes. The reasonable-sounding objection is that the model was
+*trained* that way, so inference should match it.
+
+It should not, for two reasons.
+
+**There is no single padding to reproduce.** Batches were reshuffled every
+epoch, so each sequence was seen with a different, random amount of padding.
+The dilution was noise the model trained through, not a feature it relies on.
+`group_by_length` pads nothing, which is exactly what the longest member of
+any training batch saw.
+
+**It would make the output depend on batch bookkeeping.** A full sweep is
+940,520 predictions chunked 20,000 pairs at a time. Under `batch_max` the
+returned top-20 would shift with `--pair-chunk` and `--batch-size`, so two
+runs of the same input could disagree about the winner. That is disqualifying
+for a portal regardless of accuracy.
+
+And the accuracy cost is nil. Both modes scored against measured Tp:
+
+| dataset | distinct lengths | Δρ (amplified) | ΔAUC | mean per-row Δ |
+|---|---|---|---|---|
+| Borrelia | 1 | 0.0000 | 0.0000 | 0.00 min |
+| LASV | 3 | 0.0003 | 0.0006 | 0.11 min |
+| mpox | 14 | 0.0017 | 0.0003 | 0.75 min |
+
+The differences are 3rd–4th decimal and **mixed in direction** — `batch_max`
+is marginally better on two mpox metrics and marginally worse on a third.
+That is noise, not signal. Note Borrelia is bit-identical: all 45 of its sets
+encode to the same length, so there is no padding to differ about, which is
+also the common case within a single `design` geometry.
+
+`batch_max` is kept, because reproducing a *specific* published number needs
+the batching that produced it. It is not the default.
 
 ## Not implemented
 
