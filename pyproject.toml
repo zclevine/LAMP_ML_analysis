@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "lamp-design"
+version = "0.1.0"
+description = "ML-guided LAMP primer set design"
+requires-python = ">=3.10"
+dependencies = [
+    "numpy>=1.26",
+    "pandas>=2.0",
+    "biopython>=1.83",
+    "primer3-py>=2.0",
+    "ViennaRNA>=2.6",
+    "torch>=2.2",
+    "scipy>=1.11",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0", "pytest-cov"]
+streamlit = ["streamlit>=1.40"]
+modal = ["modal>=0.64"]
+
+[project.scripts]
+lamp-design = "lamp_design.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]

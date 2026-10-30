@@ -1,0 +1,43 @@
+# Build context hygiene: keep the image small and keep weights out of it.
+
+# Model weights are NEVER baked into the image -- they mount at run time and
+# are found via $LAMP_DESIGN_WEIGHTS. Checkpoints are also hundreds of MB.
+weights/
+checkpoints/
+*.pt
+*.pth
+*.ckpt
+
+# Local environments and caches
+.venv/
+venv/
+env/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.ipynb_checkpoints/
+
+# VCS and editor state
+.git/
+.gitignore
+.github/
+.idea/
+.vscode/
+*.swp
+
+# Run outputs and local data
+runs/
+outputs/
+*.diagnostics.json
+
+# Docker itself
+Dockerfile
+.dockerignore

@@ -1,0 +1,12 @@
+.venv/
+__pycache__/
+*.pyc
+*.egg-info/
+.pytest_cache/
+# model weights are never committed -- resolve via LAMP_DESIGN_WEIGHTS
+*.pt
+*.pth
+weights/
+runs/
+build/
+dist/
