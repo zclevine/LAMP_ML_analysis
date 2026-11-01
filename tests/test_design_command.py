@@ -54,12 +54,20 @@ requires_weights = pytest.mark.skipif(_weights() is None, reason="LAMP_DESIGN_WE
 # --------------------------------------------------------------- conditions
 
 
-def test_default_conditions_are_the_notes_sweep():
+def test_default_conditions_are_one_mix_at_two_concentrations():
+    """1 mix x 2 concentrations, deliberately -- not the 2x2 it used to be.
+
+    Ranking consumes exactly one condition, so extra *mixes* cost inference
+    (89% of runtime) and change no ranking. The second *concentration* is kept
+    because it is the robustness column, and it is cheap relative to a mix.
+    """
     conds = build_conditions()
-    assert len(conds) == len(DEFAULT_MASTER_MIXES) * len(DEFAULT_CONCENTRATIONS) == 4
-    # mixes-major: all of the first mix, then all of the second
-    assert [c.master_mix for c in conds] == ["BST", "BST", "SS", "SS"]
+    assert len(conds) == len(DEFAULT_MASTER_MIXES) * len(DEFAULT_CONCENTRATIONS) == 2
+    assert [c.master_mix for c in conds] == ["SS", "SS"]
     assert {c.target_conc for c in conds} == set(DEFAULT_CONCENTRATIONS)
+    # The default ranking condition is the comfortable concentration, so the
+    # low-copy prediction never silently drives the ranking.
+    assert _ranking_condition(conds, None, None).target_conc == max(DEFAULT_CONCENTRATIONS)
 
 
 def test_unknown_master_mix_is_rejected_with_the_trained_set():

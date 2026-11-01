@@ -15,6 +15,13 @@ from typing import Any
 import streamlit as st
 
 import _backend
+
+#: Mirrors ``MAX_CONCENTRATIONS`` in ``deploy/modal/app.py``, which is the
+#: enforcement point. Duplicated rather than imported because that module
+#: requires ``modal``, which the front end must not need; a test asserts the
+#: two stay equal, the same way ``ENVELOPE_SCHEMA`` is kept in step.
+_MODAL_MAX_CONCENTRATIONS = 4
+
 from _engine_api import (
     DEFAULT_CENSOR_MINUTES,
     DEFAULT_CONCENTRATIONS,
@@ -447,14 +454,25 @@ def preflight_checks() -> tuple[list[str], list[str]]:
             "No usable GPU here, so inference runs on CPU. Measured on this pipeline "
             "that is roughly 11x slower (206 vs 2,292 predictions/s)."
         )
+    if _backend.active_backend() != "local" and len(params["master_mixes"]) > 1:
+        # Concentrations fan out remotely now; master mixes still do not.
+        # `_validate_request` in deploy/modal/app.py takes one `master_mix`
+        # and a list of `target_concs`.
+        cautions.append(
+            f"The deployed Modal functions take one master mix per request, so this "
+            f"run will score only {params['rank_master_mix']} remotely, not all "
+            f"{len(params['master_mixes'])} selected. Concentrations do fan out. "
+            "Use the local backend to sweep mixes."
+        )
     if (
         _backend.active_backend() != "local"
-        and len(params["master_mixes"]) * len(params["concentrations"]) > 1
+        and len(params["concentrations"]) > _MODAL_MAX_CONCENTRATIONS
     ):
         cautions.append(
-            "The deployed Modal functions accept a single condition per request "
-            "(`_validate_request` in deploy/modal/app.py), so a remote run will score "
-            "only the ranking condition. Use the local backend for a full sweep."
+            f"{len(params['concentrations'])} concentrations exceeds the remote cap of "
+            f"{_MODAL_MAX_CONCENTRATIONS} (LAMP_DESIGN_MAX_CONCENTRATIONS). Each one is "
+            "another full inference pass over every candidate, and inference is 89% of "
+            "a run, so the cap is a spend control rather than a technical limit."
         )
     if workflow() == "design" and params["stride"] == 1:
         cautions.append(

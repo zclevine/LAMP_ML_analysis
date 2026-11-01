@@ -7,26 +7,34 @@ matters. See ``deploy/modal/README.md`` for the setup steps that remain.
 
 Why the topology looks like this
 -------------------------------
-``docs/ARCHITECTURE.md`` is explicit that **the bottleneck is dG on CPU, not
-the model on GPU**: the trained net is ~100K parameters in a 5-seed ensemble,
-while the expensive stage is one ViennaRNA dG per unique (primer, target) pair.
-The failure mode to avoid is the obvious one -- a single expensive GPU
-container where the accelerator idles while one core grinds through RNAduplex.
+An earlier version of this file said the bottleneck was dG on CPU rather than
+the model on GPU, and built a thermo-only fan-out around that claim. **It is
+the other way around.** Measured on an L4 over a stride-1 sweep (461.18 s,
+940,520 predictions, docs/ARCHITECTURE.md):
 
-So there are two paths over the *same* stage sequence (`_prepare_stage` ->
-thermo -> `_infer_stage`); they differ only in how thermo is parallelised:
+    generation   0.50 s   0.1%
+    thermo      48.60 s  10.5%
+    inference  410.35 s  89.0%     <- this is the stage that costs
+    report       1.72 s   0.4%
+
+The net really is ~100K parameters in a 5-seed ensemble, but it is run over
+hundreds of thousands of (set, target, condition) rows, and batching dG
+removed thermo as a rival (38x, plus a 16x dedup factor). So fanning out
+thermo alone caps at 1/(1-0.105) = **1.1x** by Amdahl, which is why that path
+is gone. Both surviving paths run the same stage sequence (`_prepare_stage` ->
+thermo -> `_infer_stage`) and differ in how the *candidates* are split:
 
 1. ``design_single_container``  -- V1 PATH, probably what you run first.
    One container: a GPU plus ``SINGLE_CONTAINER_CPUS`` cores, thermo spread
-   over a multiprocessing pool. One cold start, nothing crosses the wire. The
-   GPU is still idle during thermo; at design scale that waste is cents, and
-   this path is far easier to reason about when something breaks.
+   over a multiprocessing pool. One cold start, nothing crosses the wire.
 
 2. ``design_fanout``            -- SCALE-UP PATH.
-   ``thermo_chunk`` is CPU-only and fans out over primer-set chunks with
-   ``.map()`` at high container concurrency; ``infer`` is the only function
-   that ever asks for a GPU, and it runs once over the assembled features.
-   Use this when the panel is large enough that thermo dominates wall clock.
+   Shards the candidate sets across up to ``INFER_MAX_CONTAINERS`` GPU
+   containers (``design_shard``), each doing its own thermo + inference, and
+   ranks after the merge. Every set's predicted Tp is independent of every
+   other's, so this is embarrassingly parallel over 99.5% of the run. Modal
+   bills per GPU-second, so N containers cost what one does and finish in
+   ~1/N the wall clock.
 
 Both return the same payload: ``report.result_to_dict`` -- the engine's own
 "for the web UI" serialisation -- inside a thin envelope carrying the run id,
@@ -47,7 +55,7 @@ import os
 import time
 import uuid
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any, Iterator, Optional
 
 import modal
 
@@ -74,14 +82,26 @@ REPO_REMOTE = "/root/lamp-design"
 
 #: Resolved from this file's location rather than hardcoded, so the image
 #: builds from whatever checkout you deploy from. deploy/modal/app.py -> repo.
-LOCAL_REPO = Path(__file__).resolve().parents[2]
+#:
+#: Guarded, because this module is imported INSIDE the container too: there the
+#: file lands at /root/app.py, `parents` is just (/root, /), and the bare
+#: `parents[2]` raised IndexError at import and killed every function during
+#: startup -- the first real Modal run failed on exactly this. Only the client
+#: side (the image definition below) ever needs the true checkout path; in the
+#: container the repo is already mounted at REPO_REMOTE.
+_THIS_FILE = Path(__file__).resolve()
+LOCAL_REPO = (
+    _THIS_FILE.parents[2] if len(_THIS_FILE.parents) > 2 else Path(REPO_REMOTE)
+)
 
 #: Where LAMP_DESIGN_WEIGHTS points inside the container. The layout
 #: `models.inference.discover_checkpoints` expects is `<run>/seed_*/` with one
 #: `best_model_*.pt` each, for seeds 0, 1, 2, 3, 42.
-WEIGHTS_SUBDIR = os.environ.get(
-    "LAMP_DESIGN_WEIGHTS_SUBDIR", "LAMP_experiment_20260905_021750_tp60_A_v0t9"
-)
+#: Checkpoint directory inside the weights volume. Named for the training run
+#: suffix rather than the full experiment directory, to match the local layout
+#: (~/lamp-weights/tp60_A_v0t9/seed_{0,1,2,3,42}/best_model.pt) so the same
+#: name works locally and remotely. Override with LAMP_DESIGN_WEIGHTS_SUBDIR.
+WEIGHTS_SUBDIR = os.environ.get("LAMP_DESIGN_WEIGHTS_SUBDIR", "tp60_A_v0t9")
 
 # ---------------------------------------------------------------------------
 # Pinned tool versions
@@ -133,6 +153,10 @@ PIP_PINS = (
     # bound in pyproject.toml.
     "primer3-py==2.0.3",
     "scipy==1.15.3",
+    # models/lyra/s4d.py imports this at module level, so it is required on
+    # the inference path, not optional. Pinned like the rest because this list
+    # is the reproducibility record for a deployed run.
+    "einops==0.8.2",
 )
 
 # ---------------------------------------------------------------------------
@@ -170,13 +194,6 @@ INFER_CPUS = float(os.environ.get("LAMP_DESIGN_INFER_CPUS", "4"))
 #: conditions, 2,000 sets is roughly 35s of GPU work per shard.
 INFER_SHARD_SETS = int(os.environ.get("LAMP_DESIGN_INFER_SHARD_SETS", "2000"))
 
-#: Fan-out width for the CPU thermo stage, used only by the legacy thermo-only
-#: fan-out path. Retained because a very wide panel (many targets) shifts the
-#: balance back toward thermo, but it is not the default: thermo is 10.5% of a
-#: representative run, so fanning it out alone caps at a 1.1x speedup.
-THERMO_MAX_CONTAINERS = int(os.environ.get("LAMP_DESIGN_THERMO_CONTAINERS", "50"))
-THERMO_CPUS = float(os.environ.get("LAMP_DESIGN_THERMO_CPUS", "2"))
-
 #: Primer sets per chunk, for both the container fan-out and the in-process
 #: pool. A chunk must do enough work to amortise its own startup (seconds for a
 #: container, ~nothing for a forked worker), so prefer chunks of >=10s of
@@ -189,6 +206,60 @@ SINGLE_CONTAINER_MEMORY_MB = int(os.environ.get("LAMP_DESIGN_SINGLE_MEMORY_MB", 
 
 #: MAFFT threads inside prepare.
 ALIGN_THREADS = int(os.environ.get("LAMP_DESIGN_ALIGN_THREADS", "4"))
+
+# ---------------------------------------------------------------------------
+# Spend circuit breaker
+#
+# Two jobs: keep an honest run from quietly eating the account's credits, and
+# keep abusive or runaway traffic from doing it fast. The input caps further
+# down bound what ONE request can cost; these bound what ALL requests can cost
+# per unit time, which is the only thing that helps when the requests keep
+# coming.
+#
+# Accounting is in GPU-seconds, recorded by this app into a `modal.Dict` after
+# each run. Three thresholds, deliberately different in kind:
+#
+#   * hourly  -> DEGRADE. Stop fanning out; run single-container instead. The
+#     job still completes, just on one GPU, so a busy hour slows down rather
+#     than failing.
+#   * daily   -> REFUSE, with a message saying when it resets.
+#   * total   -> REFUSE. The cumulative ceiling the project agreed to.
+#
+# HONEST LIMITS OF THIS LEDGER, because a budget control that is trusted
+# further than it works is worse than none:
+#   1. It counts only what goes through these functions. `doctor`, other apps
+#      in the workspace, and anything run by hand are invisible to it.
+#   2. A container killed mid-run (timeout, OOM, preemption) may never reach
+#      its record call, so usage is under-counted on exactly the failures that
+#      waste the most.
+#   3. It is advisory, enforced in our code. Modal's own workspace spend limit
+#      is the only control that cannot be bypassed by a bug in this file, and
+#      it should be set in the dashboard as well.
+# ---------------------------------------------------------------------------
+
+#: Fan-out is disabled above this many GPU-hours in the trailing hour.
+#:
+#: NOTE: on the free plan `INFER_MAX_CONTAINERS` = 10 makes 10 GPU-hours per
+#: wall-clock hour the physical ceiling, so a 20 GPU-hour hourly limit cannot
+#: currently be reached -- max_containers is the tighter control. This stays
+#: because that ceiling moves (the Team plan allows 50 concurrent GPUs) and a
+#: limit that only matters later is still worth writing down now.
+BUDGET_HOURLY_GPU_HOURS = float(os.environ.get("LAMP_DESIGN_HOURLY_GPU_HOURS", "20"))
+
+#: Runs are refused above this many GPU-hours in the trailing 24 hours.
+BUDGET_DAILY_GPU_HOURS = float(os.environ.get("LAMP_DESIGN_DAILY_GPU_HOURS", "50"))
+
+#: Runs are refused above this many GPU-hours in total, ever.
+#:
+#: 20 is the cumulative ceiling agreed for this project. It is also the one
+#: threshold that binds in practice: at the L4 rate of $0.000222/GPU-s, the
+#: free plan's $30 monthly credit is only ~37.5 GPU-hours, so the *credit*
+#: runs out well before 50 GPU-hours/day could ever trigger. Keeping the total
+#: under the credit is what actually prevents a surprise bill.
+BUDGET_TOTAL_GPU_HOURS = float(os.environ.get("LAMP_DESIGN_TOTAL_GPU_HOURS", "20"))
+
+#: Set to "0" to run with no ledger at all (for a deliberate benchmark).
+BUDGET_ENABLED = os.environ.get("LAMP_DESIGN_BUDGET", "1") not in {"0", "false", "no"}
 
 # ---------------------------------------------------------------------------
 # Input caps -- so a large upload cannot run away with the account's credits.
@@ -216,6 +287,13 @@ MAX_CANDIDATE_SETS = int(os.environ.get("LAMP_DESIGN_MAX_CANDIDATE_SETS", "20000
 
 MAX_N_SETS = 500
 MAX_STRIDE = 500
+
+#: Cap on concentrations per request. Each one is another full inference pass
+#: over every candidate, and inference is 89% of a run -- so this is the knob
+#: that multiplies cost, and it is the one worth bounding server-side. 4 leaves
+#: room for the engine's default 2 plus a couple, and refuses a sweep that
+#: would quietly cost 10x.
+MAX_CONCENTRATIONS = int(os.environ.get("LAMP_DESIGN_MAX_CONCENTRATIONS", "4"))
 
 # ---------------------------------------------------------------------------
 # Image
@@ -264,12 +342,47 @@ image = (
             "PYTHONUNBUFFERED": "1",
             # Keep BLAS from oversubscribing cores inside a thermo pool worker.
             "OMP_NUM_THREADS": "1",
+            # ---------------------------------------------------------------
+            # Tunables that are read INSIDE a function body have to be baked
+            # into the image, not just exported in the deploying shell.
+            #
+            # The README said "set them in the shell you run `modal deploy`
+            # from", which is only true for values the *client* evaluates --
+            # `gpu=`, `cpu=`, `max_containers=` on the decorators. Anything
+            # read via os.environ at module scope and then used in a container
+            # (shard size, chunk size, the budget ceilings) gets the container's
+            # environment, which did not carry them: a run with
+            # LAMP_DESIGN_INFER_SHARD_SETS=25 still sharded at the default
+            # 2000 and silently produced one shard. Forwarding them here makes
+            # the documented behaviour real.
+            # ---------------------------------------------------------------
+            "LAMP_DESIGN_INFER_SHARD_SETS": str(INFER_SHARD_SETS),
+            "LAMP_DESIGN_THERMO_CHUNK": str(THERMO_CHUNK_SIZE),
+            "LAMP_DESIGN_ALIGN_THREADS": str(ALIGN_THREADS),
+            "LAMP_DESIGN_MAX_FASTA_BYTES": str(MAX_FASTA_BYTES),
+            "LAMP_DESIGN_MAX_BUDGET": str(MAX_BUDGET),
+            "LAMP_DESIGN_MAX_CANDIDATE_SETS": str(MAX_CANDIDATE_SETS),
+            "LAMP_DESIGN_MAX_CONCENTRATIONS": str(MAX_CONCENTRATIONS),
+            # The spend ceilings especially: a breaker configured only on the
+            # client would not be a breaker at all.
+            "LAMP_DESIGN_HOURLY_GPU_HOURS": str(BUDGET_HOURLY_GPU_HOURS),
+            "LAMP_DESIGN_DAILY_GPU_HOURS": str(BUDGET_DAILY_GPU_HOURS),
+            "LAMP_DESIGN_TOTAL_GPU_HOURS": str(BUDGET_TOTAL_GPU_HOURS),
+            "LAMP_DESIGN_BUDGET": "1" if BUDGET_ENABLED else "0",
         }
     )
 )
 
 weights_volume = modal.Volume.from_name(WEIGHTS_VOLUME, create_if_missing=True)
 results_volume = modal.Volume.from_name(RESULTS_VOLUME, create_if_missing=True)
+
+#: The spend ledger. A Dict rather than a file on the results volume because
+#: several containers record into it concurrently and a volume gives no
+#: read-modify-write ordering, while a Dict entry is a single atomic put.
+budget_dict = modal.Dict.from_name(
+    os.environ.get("LAMP_DESIGN_BUDGET_DICT", "lamp-design-budget"),
+    create_if_missing=True,
+)
 
 # A Secret is the way to override LAMP_DESIGN_WEIGHTS (a different checkpoint,
 # or a download URL) without rebuilding the image. Modal has no concept of an
@@ -512,21 +625,41 @@ def _concat_thermo(tables: list) -> Any:
         set_ids.extend(table.set_ids)
         target_names.extend(table.target_names)
 
-    # target_windows defaults to an empty (0, 0) array in types.py. Only
-    # concatenate it when every chunk actually populated it; otherwise leave
-    # the default and let the encoder complain about the real problem.
+    # target_windows is REQUIRED, and it has to go in the constructor.
+    #
+    # This was previously assigned *after* construction, behind a `have_windows`
+    # guard that left the field at its default when a chunk looked unpopulated.
+    # That could never work: `ThermoTable.__post_init__` validates
+    # target_windows.shape == (n, 8), so construction raised
+    # "target_windows must have shape (344, 8), got (0, 8)" before the
+    # assignment line was ever reached. The first real Modal design run died
+    # on exactly that. (The old comment claimed the default was an unvalidated
+    # (0, 0); types.py has since both reshaped and validated it.)
+    #
+    # Failing loudly on a wrong shape is also right on the merits: the
+    # sequence encoder indexes target_windows[i, j] in lockstep with
+    # values[i, j], so a silently-defaulted field is a mis-encoding, not a
+    # missing nicety.
     windows = [t.target_windows for t in tables]
-    have_windows = all(w.shape[:1] == (len(t.set_ids),) for w, t in zip(windows, tables))
+    wrong = [
+        f"chunk {i}: {w.shape} != {(len(t.set_ids), len(PRIMER_TYPE_ORDER))}"
+        for i, (w, t) in enumerate(zip(windows, tables))
+        if w.shape != (len(t.set_ids), len(PRIMER_TYPE_ORDER))
+    ]
+    if wrong:
+        raise ValueError(
+            "thermo chunk(s) returned target_windows of the wrong shape, which "
+            "cannot be defaulted away because the encoder reads it positionally: "
+            + "; ".join(wrong)
+        )
 
-    merged = ThermoTable(
+    return ThermoTable(
         set_ids=set_ids,
         target_names=target_names,
         values=np.concatenate([t.values for t in tables], axis=0),
         globals_=np.concatenate([t.globals_ for t in tables], axis=0),
+        target_windows=np.concatenate(windows, axis=0),
     )
-    if have_windows:
-        merged.target_windows = np.concatenate(windows, axis=0)
-    return merged
 
 
 # ---------------------------------------------------------------------------
@@ -584,13 +717,59 @@ def _validate_request(request: dict) -> dict:
     if master_mix not in MASTER_MIXES:
         raise ValueError(f"master_mix must be one of {list(MASTER_MIXES)}, got {master_mix!r}")
 
+    # Concentrations are a LIST. The engine's default sweep is one master mix
+    # at two concentrations (commands.design.DEFAULT_CONCENTRATIONS: one
+    # comfortable, one near the limit of detection), and a remote run that
+    # accepted only one would hand back a narrower table than the identical
+    # local run -- silently, because nothing would error. `target_conc` is
+    # still accepted as a one-element shorthand.
+    from lamp_design.commands.design import DEFAULT_CONCENTRATIONS
+
+    raw_concs = request.get("target_concs")
+    if raw_concs is None:
+        single = request.get("target_conc")
+        raw_concs = [single] if single is not None else list(DEFAULT_CONCENTRATIONS)
+    if not isinstance(raw_concs, (list, tuple)):
+        raw_concs = [raw_concs]
     try:
-        target_conc = float(request.get("target_conc", 10000.0))
+        target_concs = [float(c) for c in raw_concs]
     except (TypeError, ValueError) as exc:
-        raise ValueError("target_conc must be a number") from exc
-    if not target_conc > 0:
+        raise ValueError("target_concs must be a list of numbers") from exc
+    if not target_concs:
+        raise ValueError("target_concs must not be empty")
+    if any(c <= 0 for c in target_concs):
         # encoding.encode_target_concentration is log10(conc) - 3.
-        raise ValueError("target_conc must be > 0 (encoded as log10(conc) - 3)")
+        raise ValueError("every target_conc must be > 0 (encoded as log10(conc) - 3)")
+    if len(target_concs) > MAX_CONCENTRATIONS:
+        raise ValueError(
+            f"{len(target_concs)} concentrations given; the cap is "
+            f"{MAX_CONCENTRATIONS} (LAMP_DESIGN_MAX_CONCENTRATIONS). Every "
+            "extra concentration is another full inference pass over every "
+            "candidate, and inference is 89% of a run."
+        )
+    # Dedupe, order-preserving: a duplicate would double the inference cost
+    # for a column that already exists.
+    deduped: list[float] = []
+    for conc in target_concs:
+        if conc not in deduped:
+            deduped.append(conc)
+    target_concs = deduped
+
+    # The concentration sets are *ranked* under. Explicit, else the highest,
+    # matching commands.design._ranking_condition -- so the low-copy
+    # prediction is the robustness column and never silently drives ranking.
+    raw_rank = request.get("rank_conc")
+    try:
+        target_conc = float(raw_rank) if raw_rank is not None else max(target_concs)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("rank_conc must be a number") from exc
+    if target_conc not in target_concs:
+        raise ValueError(
+            f"rank_conc {target_conc:g} is not among the concentrations being "
+            f"scored ({', '.join(format(c, 'g') for c in target_concs)}); it has "
+            "to be one of them or the ranking refers to a prediction that was "
+            "never made"
+        )
 
     n_default_geometries = len(_engine("default_geometries")())
 
@@ -638,6 +817,9 @@ def _validate_request(request: dict) -> dict:
         ),
         "fasta": fasta,
         "master_mix": master_mix,
+        #: Every concentration scored, in request order.
+        "target_concs": target_concs,
+        #: The one that ranks. Always a member of `target_concs`.
         "target_conc": target_conc,
         "n_sets": n_sets,
         "stride": stride,
@@ -678,6 +860,152 @@ def _run_dir(run_id: str) -> Path:
 def _chunked(items: list, size: int) -> Iterator[list]:
     for start in range(0, len(items), size):
         yield items[start : start + size]
+
+
+# ---------------------------------------------------------------------------
+# Spend ledger (see "Spend circuit breaker" above for what it does NOT cover)
+# ---------------------------------------------------------------------------
+
+#: One key holding both the recent-run log and the running total, so a single
+#: atomic put keeps the two consistent with each other.
+_BUDGET_KEY = "usage"
+
+_SECONDS_PER_HOUR = 3600.0
+_SECONDS_PER_DAY = 86400.0
+
+
+class BudgetExceeded(RuntimeError):
+    """The spend circuit breaker is open.
+
+    Deliberately not a ValueError: a caller needs to tell "your request is
+    malformed, fix it" from "the budget is spent, come back later", and the
+    two deserve different HTTP statuses when the endpoint exists (400 vs 429).
+    """
+
+
+def _budget_state() -> dict:
+    """The ledger as it stands, or a fresh one.
+
+    Never raises. A budget check that crashes the run it is meant to protect
+    is strictly worse than no budget check, so an unreachable or corrupt Dict
+    degrades to "no usage recorded" rather than to a failed design.
+    """
+    try:
+        state = budget_dict.get(_BUDGET_KEY)
+    except Exception as exc:  # noqa: BLE001 -- see docstring
+        print(f"[budget] ledger unreadable, treating as empty: {exc}", flush=True)
+        state = None
+    if not isinstance(state, dict):
+        return {"runs": [], "total_gpu_seconds": 0.0}
+    runs = state.get("runs")
+    # Coerced defensively: a non-numeric total (a partial write, a hand-edited
+    # Dict) would otherwise raise ValueError here and take down every run,
+    # which is the opposite of what a spend control should do when its own
+    # bookkeeping is damaged.
+    try:
+        total = float(state.get("total_gpu_seconds") or 0.0)
+    except (TypeError, ValueError):
+        print("[budget] total_gpu_seconds is not a number, treating as 0", flush=True)
+        total = 0.0
+    return {
+        "runs": runs if isinstance(runs, list) else [],
+        "total_gpu_seconds": total,
+    }
+
+
+def _budget_usage(now: Optional[float] = None) -> dict:
+    """GPU-hours in the trailing hour, the trailing day, and in total."""
+    moment = time.time() if now is None else now
+    state = _budget_state()
+    recent = [
+        (float(entry[0]), float(entry[1]))
+        for entry in state["runs"]
+        if isinstance(entry, (list, tuple)) and len(entry) >= 2
+    ]
+    hour = sum(sec for stamp, sec in recent if moment - stamp <= _SECONDS_PER_HOUR)
+    day = sum(sec for stamp, sec in recent if moment - stamp <= _SECONDS_PER_DAY)
+    return {
+        "last_hour_gpu_hours": hour / _SECONDS_PER_HOUR,
+        "last_day_gpu_hours": day / _SECONDS_PER_HOUR,
+        "total_gpu_hours": state["total_gpu_seconds"] / _SECONDS_PER_HOUR,
+        "n_runs_recorded": len(recent),
+    }
+
+
+def _budget_record(gpu_seconds: float, run_id: str, now: Optional[float] = None) -> None:
+    """Add a run's GPU-seconds to the ledger.
+
+    Entries past 24 hours are pruned, since nothing reads further back than
+    that -- but ``total_gpu_seconds`` is accumulated separately so pruning
+    never forgets the cumulative figure.
+    """
+    if not BUDGET_ENABLED or gpu_seconds <= 0:
+        return
+    moment = time.time() if now is None else now
+    try:
+        state = _budget_state()
+        kept = [
+            entry
+            for entry in state["runs"]
+            if isinstance(entry, (list, tuple))
+            and len(entry) >= 2
+            and moment - float(entry[0]) <= _SECONDS_PER_DAY
+        ]
+        kept.append([moment, float(gpu_seconds), str(run_id)])
+        budget_dict[_BUDGET_KEY] = {
+            # Bounded so a flood of tiny runs cannot grow the entry without
+            # limit; the trailing-hour and trailing-day sums are what matter
+            # and 5000 entries covers far more than a day of real traffic.
+            "runs": kept[-5000:],
+            "total_gpu_seconds": state["total_gpu_seconds"] + float(gpu_seconds),
+        }
+    except Exception as exc:  # noqa: BLE001 -- recording must not fail a run
+        print(f"[budget] could not record {gpu_seconds:.1f} GPU-s: {exc}", flush=True)
+
+
+def _budget_gate(run_id: str) -> bool:
+    """Check the breaker before doing GPU work.
+
+    Returns whether **fan-out** is still permitted. Raises
+    :class:`BudgetExceeded` when a refusing threshold is crossed.
+    """
+    if not BUDGET_ENABLED:
+        return True
+
+    usage = _budget_usage()
+    shared = (
+        f"total {usage['total_gpu_hours']:.2f} GPU-h, "
+        f"last 24h {usage['last_day_gpu_hours']:.2f} GPU-h, "
+        f"last hour {usage['last_hour_gpu_hours']:.2f} GPU-h "
+        f"over {usage['n_runs_recorded']} recorded run(s)"
+    )
+
+    if usage["total_gpu_hours"] >= BUDGET_TOTAL_GPU_HOURS:
+        raise BudgetExceeded(
+            f"cumulative GPU budget reached: {shared}. The ceiling is "
+            f"{BUDGET_TOTAL_GPU_HOURS:g} GPU-h "
+            "(LAMP_DESIGN_TOTAL_GPU_HOURS). This one does not reset on its "
+            "own -- raise the ceiling deliberately, or clear the ledger with "
+            "`modal dict clear lamp-design-budget`."
+        )
+
+    if usage["last_day_gpu_hours"] >= BUDGET_DAILY_GPU_HOURS:
+        raise BudgetExceeded(
+            f"24-hour GPU budget reached: {shared}. The ceiling is "
+            f"{BUDGET_DAILY_GPU_HOURS:g} GPU-h (LAMP_DESIGN_DAILY_GPU_HOURS). "
+            "It is a trailing window, so capacity returns gradually as the "
+            "oldest runs age out rather than at a fixed reset time."
+        )
+
+    if usage["last_hour_gpu_hours"] >= BUDGET_HOURLY_GPU_HOURS:
+        print(
+            f"[budget] run {run_id}: fan-out disabled, {shared}; hourly "
+            f"ceiling is {BUDGET_HOURLY_GPU_HOURS:g} GPU-h. Running on a "
+            "single container instead -- slower, not refused.",
+            flush=True,
+        )
+        return False
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -772,13 +1100,69 @@ def _thermo_pool(primer_sets: list, panel: Any, n_workers: int) -> Any:
     return _concat_thermo(tables)
 
 
-def _condition_from_request(req: dict) -> Any:
-    """The single reaction condition a request is scored under.
+def _record_params(
+    result: Any,
+    req: dict,
+    *,
+    n_candidates: int,
+    n_pairs: int,
+    n_predictions: int,
+    timings: dict,
+) -> Any:
+    """Populate ``DesignResult.params``, the way ``commands.design.design`` does.
+
+    `build_design_result` does NOT fill this in -- the CLI's `design()` updates
+    `result.params` itself after calling it. Both Modal paths call
+    `build_design_result` directly, so without this a remote result carried an
+    empty `params` and could not say what produced it: the front end's
+    `run_facts` showed device, conditions, geometries and every count as blank,
+    and `result.json` from a Modal run was not comparable to one from the CLI.
+    """
+    geometries = _engine("default_geometries")()[: req["n_geometries"]]
+    result.params.update(
+        {
+            "stride": req["stride"],
+            "geometries": [
+                getattr(g, "geometry_id", None) or str(g) for g in geometries
+            ],
+            "conditions": [str(c) for c in _conditions_from_request(req)],
+            "ranking_condition": str(_ranking_condition_from_request(req)),
+            "tp_threshold_minutes": req["tp_threshold_minutes"],
+            "n_requested": req["n_sets"],
+            "min_separation_bp": req["min_separation"],
+            "device": _device(),
+            "n_candidates": n_candidates,
+            "n_pairs": n_pairs,
+            "n_predictions": n_predictions,
+            "timings_s": {k: round(float(v), 3) for k, v in timings.items()},
+            # Only the remote paths set this, so an output states where it ran.
+            "runtime": "modal",
+            "gpu": GPU,
+        }
+    )
+    return result
+
+
+def _conditions_from_request(req: dict) -> list:
+    """Every reaction condition a request is scored under, in request order.
 
     One place, because the orchestrator, the shards and the single-container
-    path all have to agree on it: a shard that predicted under a different
-    condition than the one the result is labelled with would be undetectable
-    in the output.
+    path all have to agree: a shard that predicted under different conditions
+    than the ones the result is labelled with would be undetectable in the
+    output. `_validate_request` guarantees `target_concs` is a non-empty,
+    deduped list, so this needs no defaulting of its own.
+    """
+    from lamp_design.types import Condition
+
+    mix = req["master_mix"]
+    return [Condition(master_mix=mix, target_conc=conc) for conc in req["target_concs"]]
+
+
+def _ranking_condition_from_request(req: dict) -> Any:
+    """The one condition the ranking is computed under.
+
+    `_validate_request` guarantees it is a member of `target_concs`, so the
+    ranking never refers to a prediction that was not made.
     """
     from lamp_design.types import Condition
 
@@ -818,9 +1202,11 @@ def _infer_stage(
     funnel: dict,
     excluded: dict,
     warnings: list,
+    timings: Optional[dict] = None,
 ) -> Any:
     """Assembled features -> DesignResult."""
-    condition = _condition_from_request(req)
+    conditions = _conditions_from_request(req)
+    condition = _ranking_condition_from_request(req)
     weights = _resolve_weights()
 
     # `predict_tp` takes the primer sets, not the panel: ThermoTable holds the
@@ -835,12 +1221,12 @@ def _infer_stage(
     predictions = _engine("predict_tp")(
         thermo,
         primer_sets,
-        [condition],
+        conditions,
         weights=weights,
         device=_device(),
     )
 
-    return _engine("build_design_result")(
+    result = _engine("build_design_result")(
         predictions,
         primer_sets,
         panel,
@@ -854,6 +1240,14 @@ def _infer_stage(
         funnel=funnel,
         excluded_targets=excluded,
         warnings=warnings,
+    )
+    return _record_params(
+        result,
+        req,
+        n_candidates=len(primer_sets),
+        n_pairs=len(thermo.set_ids),
+        n_predictions=len(predictions),
+        timings=timings or {},
     )
 
 
@@ -907,6 +1301,34 @@ def _finish(result: Any, req: dict, run_dir: Path, timing: dict) -> dict:
 # ---------------------------------------------------------------------------
 
 
+@app.function(timeout=120)
+def budget_report() -> dict:
+    """The spend ledger, on a CPU container.
+
+    Separate from `doctor` so that checking spend costs nothing and needs no
+    volume mount -- which matters because this is the thing you want to read
+    when you suspect something is running away.
+    """
+    usage = _budget_usage()
+    return {
+        **usage,
+        "enabled": BUDGET_ENABLED,
+        "ceilings_gpu_hours": {
+            "hourly_fanout_off": BUDGET_HOURLY_GPU_HOURS,
+            "daily_refuse": BUDGET_DAILY_GPU_HOURS,
+            "total_refuse": BUDGET_TOTAL_GPU_HOURS,
+        },
+        "remaining_gpu_hours": {
+            "to_daily": max(0.0, BUDGET_DAILY_GPU_HOURS - usage["last_day_gpu_hours"]),
+            "to_total": max(0.0, BUDGET_TOTAL_GPU_HOURS - usage["total_gpu_hours"]),
+        },
+        # At the L4 rate from modal.com/pricing. Indicative only -- the
+        # authoritative figure is the Modal dashboard, which also sees spend
+        # this ledger cannot (see "Spend circuit breaker").
+        "approx_usd_spent_at_l4": round(usage["total_gpu_hours"] * 0.000222 * 3600, 4),
+    }
+
+
 @app.function(timeout=300, volumes={WEIGHTS_REMOTE: _read_only(weights_volume)})
 def doctor() -> dict:
     """Report the container's environment. No GPU, no weights load."""
@@ -945,6 +1367,17 @@ def doctor() -> dict:
             sorted(p.name for p in weights_root.iterdir()) if weights_root.exists() else []
         ),
         "engine_api_present": sorted(k for k in ENGINE_API if _has_engine(k)),
+        # The spend ledger, so `doctor` answers "how much have we used?"
+        # without starting a GPU. Cheap: one Dict read.
+        "budget": {
+            **_budget_usage(),
+            "enabled": BUDGET_ENABLED,
+            "ceilings_gpu_hours": {
+                "hourly_fanout_off": BUDGET_HOURLY_GPU_HOURS,
+                "daily_refuse": BUDGET_DAILY_GPU_HOURS,
+                "total_refuse": BUDGET_TOTAL_GPU_HOURS,
+            },
+        },
         "engine_api_missing": sorted(k for k in ENGINE_API if not _has_engine(k)),
     }
 
@@ -981,95 +1414,6 @@ def doctor_gpu() -> dict:
     except Exception as exc:
         facts["ensemble"] = f"{type(exc).__name__}: {exc}"
     return facts
-
-
-# ---------------------------------------------------------------------------
-# Stage 1 (CPU, fan-out): thermodynamic features.
-#
-# No GPU here, by design -- this is the stage ARCHITECTURE.md identifies as the
-# bottleneck. `retries=2` is safe because thermo is a pure function of
-# (primer sets, panel): a retried chunk recomputes the same numbers.
-# ---------------------------------------------------------------------------
-
-#: Containers are reused across inputs, so cache the panel per run id rather
-#: than re-reading it from the volume for every chunk.
-_PANEL_CACHE: dict[str, Any] = {}
-
-
-@app.function(
-    cpu=THERMO_CPUS,
-    timeout=1800,
-    retries=2,
-    max_containers=THERMO_MAX_CONTAINERS,
-    volumes={RESULTS_REMOTE: results_volume},
-)
-def thermo_chunk(job: dict) -> Any:
-    """Features for one chunk of primer sets against the whole panel.
-
-    The panel is read from the results volume rather than passed in the input,
-    so a wide fan-out does not re-serialise the panel once per chunk.
-    """
-    import json
-
-    run_id = job["run_id"]
-    panel = _PANEL_CACHE.get(run_id)
-    if panel is None:
-        results_volume.reload()
-        panel_path = _run_dir(run_id) / "panel.json"
-        if not panel_path.exists():
-            raise RuntimeError(f"panel.json missing for run {run_id}; orchestrator did not commit")
-        panel = _panel_from_json(json.loads(panel_path.read_text()))
-        _PANEL_CACHE[run_id] = panel
-
-    return _compute_chunk([_set_from_json(blob) for blob in job["sets"]], panel)
-
-
-# ---------------------------------------------------------------------------
-# Stage 2 (GPU, single container): inference + ranking.
-#
-# The only function in the fan-out path that asks for a GPU. Ranking runs here
-# too because it is cheap -- a second container would cost more in cold start
-# than it saves.
-# ---------------------------------------------------------------------------
-
-
-@app.function(
-    gpu=GPU,
-    timeout=1800,
-    retries=1,
-    secrets=SECRETS,
-    volumes={
-        WEIGHTS_REMOTE: _read_only(weights_volume),
-        RESULTS_REMOTE: results_volume,
-    },
-)
-def infer(run_id: str, thermo_tables: list, req: dict, timing: dict) -> dict:
-    """Assembled features -> ranked result envelope."""
-    import json
-
-    started = time.time()
-    results_volume.reload()
-    run_dir = _run_dir(run_id)
-    panel = _panel_from_json(json.loads((run_dir / "panel.json").read_text()))
-    primer_sets = [
-        _set_from_json(blob) for blob in json.loads((run_dir / "candidates.json").read_text())
-    ]
-    meta = json.loads((run_dir / "prepare_meta.json").read_text())
-
-    result = _infer_stage(
-        _concat_thermo(thermo_tables),
-        panel,
-        primer_sets,
-        req,
-        funnel=meta["funnel"],
-        excluded=meta["excluded"],
-        warnings=meta["warnings"],
-    )
-    timing = {**timing, "infer": time.time() - started}
-    timing["total"] = sum(timing.values())
-    envelope = _finish(result, req, run_dir, timing)
-    results_volume.commit()
-    return envelope
 
 
 # ---------------------------------------------------------------------------
@@ -1121,6 +1465,11 @@ def design_fanout(request: dict) -> dict:
     run_dir = _run_dir(run_id)
     timing: dict[str, float] = {}
 
+    # Before any GPU work: the breaker may refuse the run outright, or allow
+    # it while withdrawing fan-out. Prepare is CPU-cheap but there is no point
+    # doing it for a run that is about to be refused.
+    fanout_allowed = _budget_gate(run_id)
+
     started = time.time()
     prepared, primer_sets, funnel = _prepare_stage(req, run_dir)
     timing["prepare"] = time.time() - started
@@ -1143,14 +1492,19 @@ def design_fanout(request: dict) -> dict:
     )
     results_volume.commit()
 
+    # One shard holding everything when the breaker withdrew fan-out: the same
+    # total GPU-seconds on one container instead of many, so the job completes
+    # and only its wall clock suffers.
+    shard_size = len(primer_sets) if not fanout_allowed else INFER_SHARD_SETS
     shards = [
         {"run_id": run_id, "sets": [_set_to_json(s) for s in shard], "req": req}
-        for shard in _chunked(primer_sets, INFER_SHARD_SETS)
+        for shard in _chunked(primer_sets, max(1, shard_size))
     ]
     print(
         f"run={run_id} targets={panel.n_targets} budget={panel.budget} "
         f"sets={len(primer_sets)} shards={len(shards)} "
-        f"max_containers={INFER_MAX_CONTAINERS} gpu={GPU}",
+        f"max_containers={INFER_MAX_CONTAINERS} gpu={GPU} "
+        f"fanout={'on' if fanout_allowed else 'OFF (budget)'}",
         flush=True,
     )
 
@@ -1158,13 +1512,20 @@ def design_fanout(request: dict) -> dict:
     predictions: list = []
     mismatches: dict = {}
     n_pairs = 0
+    gpu_seconds = 0.0
     for shard_result in design_shard.map(shards):
         predictions.extend(_predictions_from_json(shard_result["predictions"]))
         mismatches.update(
             {(s, t): m for s, t, m in shard_result["mismatches"]}
         )
         n_pairs += shard_result["n_pairs"]
+        gpu_seconds += float(shard_result.get("gpu_seconds") or 0.0)
     timing["shards"] = time.time() - started
+    # Recorded as soon as the GPU work is done, not at the end: ranking runs
+    # on a CPU container, and a failure there must not lose the accounting for
+    # GPU time already spent.
+    _budget_record(gpu_seconds, run_id)
+    timing["gpu_seconds"] = gpu_seconds
     print(
         f"run={run_id} merged {len(predictions):,} predictions over "
         f"{n_pairs:,} pairs from {len(shards)} shard(s)",
@@ -1178,7 +1539,7 @@ def design_fanout(request: dict) -> dict:
         predictions,
         primer_sets,
         panel,
-        ranking_condition=_condition_from_request(req),
+        ranking_condition=_ranking_condition_from_request(req),
         tp_threshold=req["tp_threshold_minutes"],
         n=req["n_sets"],
         min_separation=req["min_separation"],
@@ -1187,6 +1548,16 @@ def design_fanout(request: dict) -> dict:
         excluded_targets=dict(prepared.excluded),
         warnings=list(prepared.warnings),
     )
+    _record_params(
+        result,
+        req,
+        n_candidates=len(primer_sets),
+        n_pairs=n_pairs,
+        n_predictions=len(predictions),
+        timings=dict(timing),
+    )
+    result.params["shards"] = len(shards)
+    result.params["fanout"] = fanout_allowed
     timing["rank"] = time.time() - started
     timing["total"] = sum(timing.values())
     envelope = _finish(result, req, run_dir, timing)
@@ -1215,6 +1586,7 @@ def design_shard(job: dict) -> dict:
     """
     import json
 
+    shard_started = time.time()
     results_volume.reload()
     run_dir = _run_dir(job["run_id"])
     panel = _panel_from_json(json.loads((run_dir / "panel.json").read_text()))
@@ -1225,7 +1597,7 @@ def design_shard(job: dict) -> dict:
     predictions = _engine("predict_tp")(
         thermo,
         primer_sets,
-        [_condition_from_request(req)],
+        _conditions_from_request(req),
         weights=_resolve_weights(),
         device=_device(),
     )
@@ -1236,6 +1608,10 @@ def design_shard(job: dict) -> dict:
             for (set_id, target), count in _engine("mismatch_map")(thermo).items()
         ],
         "n_pairs": len(thermo.set_ids),
+        # This container held a GPU for its whole lifetime, which only it can
+        # measure -- the orchestrator sees wall clock across all shards at
+        # once, not the GPU-seconds each one consumed.
+        "gpu_seconds": time.time() - shard_started,
     }
 
 
@@ -1275,6 +1651,13 @@ def design_single_container(request: dict) -> dict:
     run_dir = _run_dir(req["run_id"])
     timing: dict[str, float] = {}
 
+    # This container has held a GPU since it started, so the clock begins
+    # here, not at the inference stage. The breaker's return value is ignored
+    # on purpose: there is no fan-out to withdraw on this path, so only its
+    # refusing thresholds (daily, total) apply.
+    container_started = time.time()
+    _budget_gate(req["run_id"])
+
     started = time.time()
     prepared, primer_sets, funnel = _prepare_stage(req, run_dir)
     timing["prepare"] = time.time() - started
@@ -1292,9 +1675,18 @@ def design_single_container(request: dict) -> dict:
         funnel=funnel,
         excluded=dict(prepared.excluded),
         warnings=list(prepared.warnings),
+        timings=dict(timing),
     )
     timing["infer"] = time.time() - started
     timing["total"] = sum(timing.values())
+
+    # The whole container lifetime counts, including prepare and thermo: the
+    # GPU was allocated and billed throughout, idle or not. Recording the
+    # inference stage alone would under-count by ~11% and make the ledger
+    # cheerfully wrong in the one direction that matters.
+    gpu_seconds = time.time() - container_started
+    _budget_record(gpu_seconds, req["run_id"])
+    timing["gpu_seconds"] = gpu_seconds
 
     envelope = _finish(result, req, run_dir, timing)
     results_volume.commit()
@@ -1321,8 +1713,12 @@ def design_single_container(request: dict) -> dict:
 def main(
     mode: str = "doctor",
     fasta: str = "",
-    master_mix: str = "BST",
-    target_conc: float = 10000.0,
+    master_mix: str = "SS",
+    # Comma-separated, e.g. "10000,100". Empty means the engine's own default
+    # sweep (commands.design.DEFAULT_CONCENTRATIONS), so `modal run` and
+    # `lamp-design design` agree out of the box.
+    target_concs: str = "",
+    rank_conc: float = 0.0,
     n_sets: int = 20,
     stride: int = 5,
     n_geometries: int = 4,
@@ -1336,6 +1732,11 @@ def main(
         print(json.dumps(doctor_gpu.remote(), indent=2), flush=True)
         return
 
+    if mode == "budget":
+        # CPU only, so checking the ledger never costs GPU time.
+        print(json.dumps(budget_report.remote(), indent=2), flush=True)
+        return
+
     if not fasta:
         raise SystemExit("--fasta PATH is required for modes sync/fanout/spawn")
     path = Path(fasta)
@@ -1344,15 +1745,18 @@ def main(
         # Fail before uploading anything.
         raise SystemExit(f"{path} is {n_bytes} bytes, over the {MAX_FASTA_BYTES}-byte cap")
 
-    request = {
+    request: dict = {
         "fasta": path.read_text(),
         "master_mix": master_mix,
-        "target_conc": target_conc,
         "n_sets": n_sets,
         "stride": stride,
         "n_geometries": n_geometries,
         "pre_aligned": pre_aligned,
     }
+    if target_concs.strip():
+        request["target_concs"] = [float(c) for c in target_concs.split(",") if c.strip()]
+    if rank_conc:
+        request["rank_conc"] = rank_conc
 
     if mode == "sync":
         envelope = design_single_container.remote(request)
@@ -1364,7 +1768,9 @@ def main(
         print("poll with: modal.FunctionCall.from_id(call_id).get(timeout=0)", flush=True)
         envelope = call.get()
     else:
-        raise SystemExit(f"unknown --mode {mode!r}; expected doctor, sync, fanout or spawn")
+        raise SystemExit(
+            f"unknown --mode {mode!r}; expected doctor, budget, sync, fanout or spawn"
+        )
 
     result = envelope["result"]
     print(

@@ -237,12 +237,22 @@ def build_design_request(
 ) -> dict:
     """A design request, in the shape both backends accept.
 
-    ``master_mix`` / ``target_conc`` carry the ranking condition on their own as
-    well as inside ``conditions``, because ``deploy/modal/app.py``'s
-    ``_validate_request`` takes exactly one condition and ignores keys it does
-    not know. A Modal run therefore scores the ranking condition only -- which
-    is why ``warn_backend_limits`` says so on the Parameters page rather than
-    letting the result quietly contain fewer conditions than were asked for.
+    Conditions are sent three ways on purpose, because the two backends read
+    different keys and silence is the dangerous failure here:
+
+    * ``conditions`` -- the full (mix x concentration) sweep, which the local
+      backend consumes directly.
+    * ``target_concs`` + ``rank_conc`` -- the concentration sweep and which of
+      them ranks, which ``deploy/modal/app.py``'s ``_validate_request`` reads.
+    * ``master_mix`` / ``target_conc`` -- the ranking condition on its own, as
+      the one-condition shorthand older Modal revisions understood.
+
+    The remaining asymmetry is **master mix**: ``_validate_request`` takes a
+    single ``master_mix``, so a multi-*mix* sweep still scores only the ranking
+    mix remotely. ``warn_backend_limits`` says so on the Parameters page rather
+    than letting the result quietly contain fewer conditions than were asked
+    for. A multi-*concentration* sweep does now work remotely, which is the
+    default (1 mix x 2 concentrations).
     """
     return {
         "run_id": run_id,
@@ -251,6 +261,11 @@ def build_design_request(
         "conditions": build_conditions(master_mixes, concentrations),
         "master_mix": rank_master_mix,
         "target_conc": float(rank_conc),
+        # Read by the Modal side, which scores every concentration and ranks
+        # under `rank_conc`. Without these a remote run silently collapsed to
+        # the single `target_conc` above.
+        "target_concs": [float(c) for c in concentrations],
+        "rank_conc": float(rank_conc),
         "n_sets": int(n_sets),
         "stride": int(stride),
         "n_geometries": int(n_geometries),

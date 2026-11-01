@@ -61,6 +61,7 @@ RUN micromamba install -y -n base \
         numpy \
         pandas \
         scipy \
+        einops \
     && micromamba clean --all --yes
 
 ARG MAMBA_DOCKERFILE_ACTIVATE=1
@@ -81,12 +82,21 @@ RUN pip install --no-cache-dir --no-deps .
 COPY --chown=$MAMBA_USER:$MAMBA_USER . /app
 
 # Verify the external tools, the CPU-only torch, and the CLI surface.
+#
+# The model-path import on the last line is not redundant with the one above
+# it. `lamp-design --help` deliberately does NOT import torch (model imports
+# are function-local so `--help` stays fast), and the flat import list only
+# covers direct third-party deps -- so neither touches models/lyra/s4d.py.
+# A missing `einops` therefore built a clean image that failed at first
+# inference, which is exactly what happened on Modal. Importing the real
+# entry point is the only check that closes that gap.
 RUN lamp-design --help > /dev/null \
     && lamp-design prepare --help > /dev/null \
     && RNAduplex --version \
     && mafft --version 2>&1 | grep -qiE '^v[0-9]' \
     && python -c "import numpy, pandas, Bio, primer3, RNA, scipy, torch" \
-    && python -c "import torch, sys; sys.exit(0 if torch.version.cuda is None else 'torch is not the CPU build')"
+    && python -c "import torch, sys; sys.exit(0 if torch.version.cuda is None else 'torch is not the CPU build')" \
+    && python -c "from lamp_design.models.bridge import predict_tp; print('model path imports')"
 
 # Weights are mounted here; nothing is baked in.
 ENV LAMP_DESIGN_WEIGHTS=/weights

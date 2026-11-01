@@ -284,6 +284,61 @@ def test_the_envelope_schema_matches_the_modal_harness():
     assert f'ENVELOPE_SCHEMA = "{_backend.ENVELOPE_SCHEMA}"' in modal_app
 
 
+def test_the_remote_concentration_cap_matches_the_modal_side():
+    """``_layout`` warns using its own copy of the cap; it must not drift.
+
+    The front end cannot import ``deploy/modal/app.py`` (that would make
+    ``modal`` a dependency of the UI), so the number is duplicated. If the
+    enforcement point changes and the warning does not, the UI promises a
+    sweep the server will refuse.
+    """
+    import re
+
+    import _layout
+
+    modal_app = (APP_DIR.parent / "modal" / "app.py").read_text()
+    match = re.search(
+        r'MAX_CONCENTRATIONS = int\(os\.environ\.get\(\s*"LAMP_DESIGN_MAX_CONCENTRATIONS",\s*"(\d+)"',
+        modal_app,
+    )
+    assert match, "could not find MAX_CONCENTRATIONS in deploy/modal/app.py"
+    assert _layout._MODAL_MAX_CONCENTRATIONS == int(match.group(1))
+
+
+def test_a_design_request_carries_the_whole_concentration_sweep():
+    """A remote run must score every concentration, not just the ranking one.
+
+    This regressed in the other direction once: the Modal side was taught to
+    accept ``target_concs`` while the request builder still sent only
+    ``target_conc``, so a Modal run silently returned a one-condition table
+    where local returned two.
+    """
+    request = _backend.build_design_request(
+        run_id="20260101-000000-abcdef12",
+        fasta=">a\n" + "ACGT" * 50 + "\n",
+        master_mixes=["SS"],
+        concentrations=[10_000.0, 100.0],
+        rank_master_mix="SS",
+        rank_conc=10_000.0,
+        n_sets=20,
+        stride=20,
+        n_geometries=1,
+        tp_threshold_minutes=60.0,
+        min_separation=30,
+        pre_aligned=False,
+        device="auto",
+        threads=None,
+    )
+    assert request["target_concs"] == [10_000.0, 100.0]
+    assert request["rank_conc"] == 10_000.0
+    # The ranking condition is still carried alone, for the older shorthand.
+    assert request["target_conc"] == 10_000.0
+    assert request["rank_conc"] in request["target_concs"], (
+        "the ranking concentration has to be one of the scored ones, or the "
+        "ranking refers to a prediction that was never made"
+    )
+
+
 def test_the_backend_is_chosen_by_environment_and_defaults_to_local(monkeypatch):
     monkeypatch.delenv("LAMP_DESIGN_BACKEND", raising=False)
     assert _backend.active_backend() == "local"

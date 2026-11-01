@@ -2,31 +2,46 @@
 
 GPU/CPU harness for the LAMP design engine: [`app.py`](app.py).
 
-> **Nothing here has been run.** This repo has no Modal account, so the image
-> has never been built, no function has been deployed, and no design has
-> executed remotely. The code is written to be correct in shape and runnable
-> the moment credentials exist. Steps below are in the order you should do
-> them; [What is not verified](#what-is-not-verified) lists exactly what is
-> still unknown.
+> **Status: verified end to end on 2026-11-01.** The image builds, `doctor`
+> and `doctor_gpu` pass, and `design_single_container`, `design_fanout` and the
+> Streamlit backend seam have all produced real results on an L4 — agreeing
+> with a local run to within 2.7e-06 minutes. See
+> [What has been verified](#what-has-been-verified) for exactly what was
+> checked and what still has not been.
 
 ## Function topology
 
 | Function | Hardware | Role |
 |---|---|---|
 | `doctor` | CPU | Reports tool versions, weights volume contents, which engine entrypoints exist. Costs ~nothing. **Run this first.** |
-| `doctor_gpu` | 1 GPU | CUDA visibility, checkpoint seed directories, whether the model loader resolves. |
-| `design_single_container` | 1 GPU + 16 CPU | **V1 path.** Whole pipeline in one container, thermodynamics on a multiprocessing pool. |
-| `design_fanout` | CPU only | **Scale-up path.** Orchestrator: prepares the panel, fans thermo out, calls `infer`. Never holds a GPU. |
-| `thermo_chunk` | CPU, up to 50 containers | One chunk of primer sets × the whole panel → `ThermoTable`. The stage that actually costs time. |
-| `infer` | 1 GPU | Assembled features → ensemble inference → ranked `DesignResult`. The only GPU in the fan-out path. |
+| `doctor_gpu` | 1 GPU | CUDA visibility, checkpoint seed directories, whether the 5-seed ensemble actually loads. |
+| `design_single_container` | 1 GPU + 16 CPU | **V1 path.** Whole pipeline in one container, thermo on a multiprocessing pool. |
+| `design_fanout` | CPU only | **Scale-up path.** Orchestrator: prepares the panel, shards candidates across `design_shard`, ranks the merge. Never holds a GPU. |
+| `design_shard` | 1 GPU + 4 CPU, up to 10 containers | Thermo + inference for one shard of candidate sets. Returns predictions and mismatch counts, not a `ThermoTable`. |
 
-Why it is split this way: `docs/ARCHITECTURE.md` establishes that **ΔG on CPU
-is the bottleneck, not the model on GPU** — the ensemble is ~100K parameters ×
-5 seeds, while every unique (primer, target) pair needs a ViennaRNA ΔG. A
-single GPU container would therefore idle an accelerator while one core grinds
-through RNAduplex. `design_fanout` removes that coupling; `design_single_container`
-accepts it in exchange for one cold start and no serialisation. See
-[`../README.md`](../README.md) for which to use when.
+**Why it is split this way — corrected.** An earlier version of this file said
+ΔG on CPU was the bottleneck and fanned *thermo* out across 50 CPU containers.
+That was wrong. Measured on an L4 over a stride-1 sweep (461.18 s, 940,520
+predictions — `docs/ARCHITECTURE.md`):
+
+| stage | seconds | share |
+|---|---|---|
+| generation | 0.50 | 0.1% |
+| thermo | 48.60 | 10.5% |
+| **inference** | **410.35** | **89.0%** |
+| report | 1.72 | 0.4% |
+
+Batching ΔG (38× on its own, plus a 16× dedup factor) removed thermo as a
+rival. So a thermo-only fan-out caps at 1/(1−0.105) = **1.1×**, and the two
+functions that implemented it (`thermo_chunk`, `infer`) have been deleted
+rather than left deployed and unreachable.
+
+What fans out now is the **candidates**. Each set's predicted Tp is independent
+of every other's — ranking is the only step that sees them together, and it
+happens in the orchestrator after the merge — so 99.5% of the run is
+embarrassingly parallel. Modal bills per GPU-second, so 10 containers cost what
+1 does and finish in ~1/10 the wall clock: **~7.7 min → ~1 min**, ~$0.09/run
+either way. See [`../README.md`](../README.md) for which path to use when.
 
 ---
 
@@ -71,31 +86,32 @@ working without it, and it does.
 Weights are **not in this repo and not in the image** — `.gitignore` excludes
 `*.pt`/`weights/`, and the image build excludes them again. They live in a
 Modal Volume mounted read-only at `/weights`, and the image sets
+`LAMP_DESIGN_WEIGHTS=/weights/tp60_A_v0t9`, which is the run directory holding
+the five seed subdirectories (`seed_0`, `seed_1`, `seed_2`, `seed_3`,
+`seed_42`), each with one `best_model.pt`.
 
-```
-LAMP_DESIGN_WEIGHTS=/weights/LAMP_experiment_20260905_021750_tp60_A_v0t9
-```
-
-which is the run directory containing the five seed subdirectories
-(`seed_0`, `seed_1`, `seed_2`, `seed_3`, `seed_42`), each with its
-`best_model_*.pt`. Upload that directory:
+> **`modal volume put` does not follow symlinks.** On the development box
+> `~/lamp-weights/tp60_A_v0t9/seed_*/best_model.pt` are all symlinks into the
+> experiments directory. Uploading that tree directly puts five broken entries
+> on the volume, and nothing complains until the ensemble fails to load inside
+> a GPU container. Dereference first:
 
 ```bash
 PY=/home/ssiddiqu/lamp-design/.venv/bin/python
-RUN=LAMP_experiment_20260905_021750_tp60_A_v0t9
 
-# The volume is also created automatically on first deploy; this is explicit.
+# -L dereferences. Check you got real files, not links.
+mkdir -p ~/lamp-weights-upload
+cp -rL ~/lamp-weights/tp60_A_v0t9 ~/lamp-weights-upload/
+find ~/lamp-weights-upload -name '*.pt' -type f    # must list five
+
 $PY -m modal volume create lamp-design-weights
+$PY -m modal volume put lamp-design-weights ~/lamp-weights-upload/tp60_A_v0t9 tp60_A_v0t9
 
-$PY -m modal volume put lamp-design-weights /local/path/to/$RUN $RUN
-
-# Verify: you should see five seed_* directories.
-$PY -m modal volume ls lamp-design-weights
-$PY -m modal volume ls lamp-design-weights $RUN
+# Verify: five seed_* directories, each with best_model.pt.
+$PY -m modal volume ls lamp-design-weights tp60_A_v0t9
 ```
 
-The checkpoints are small (~100K parameters × 5 seeds), so this is a seconds-long
-upload, not a bulk transfer.
+The checkpoints total 2.8 MB, so this is a seconds-long upload.
 
 **A different checkpoint without rebuilding the image.** `LAMP_DESIGN_WEIGHTS`
 can be overridden by a Secret. Modal has no concept of an optional Secret — a
@@ -155,7 +171,7 @@ anywhere — which is how `deploy/streamlit/app.py` reaches it.
 ```bash
 .venv/bin/python -m modal run deploy/modal/app.py \
     --mode sync --fasta targets.fasta \
-    --master-mix BST --target-conc 10000 --n-sets 20 --stride 5 --n-geometries 4
+    --master-mix SS --target-concs 10000,100 --n-sets 20 --stride 5 --n-geometries 5
 ```
 
 Input limits, all from the engine's own constants: 1–20 sequences,
@@ -174,7 +190,7 @@ take tens of seconds to minutes and are not interactive requests:
 import modal
 
 fn = modal.Function.from_name("lamp-design", "design_single_container")
-call = fn.spawn({"fasta": open("targets.fasta").read(), "master_mix": "BST",
+call = fn.spawn({"fasta": open("targets.fasta").read(), "master_mix": "SS",
                  "target_conc": 10000.0, "n_sets": 20, "stride": 5,
                  "n_geometries": 4})
 print(call.object_id)        # the poll token; keep it
@@ -226,30 +242,74 @@ editing code. Set them in the shell you run `modal deploy` from.
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `LAMP_DESIGN_MODAL_GPU` | `T4` | GPU type. The ensemble is tiny; T4 is already oversized and an A100 would be waste. |
-| `LAMP_DESIGN_THERMO_CONTAINERS` | `50` | Fan-out width for `thermo_chunk`. Container concurrency, not input concurrency — thermo is CPU-bound. |
-| `LAMP_DESIGN_THERMO_CPUS` | `2` | Cores per thermo container. |
-| `LAMP_DESIGN_THERMO_CHUNK` | `256` | Primer sets per chunk. Chunks must do enough work to amortise a cold start; this is a guess, not a measurement. |
+| `LAMP_DESIGN_MODAL_GPU` | `L4` | GPU type. L4 is the default because every performance number in `docs/ARCHITECTURE.md` was measured on one, so it is the only figure that is not an extrapolation. T4 is 26% cheaper and the GPU only reached 18–29% utilisation, so T4 may be nearly as fast — measure before switching. |
+| `LAMP_DESIGN_INFER_CONTAINERS` | `10` | Fan-out width for `design_shard`, and the free plan's concurrent-GPU limit. |
+| `LAMP_DESIGN_INFER_SHARD_SETS` | `2000` | Candidate sets per shard. **Measured:** on a 104-candidate input, 5 shards cost 26.6 GPU-s against single-container's 7.3 — each shard pays container start, weights load and torch init. Fan-out is a loss until a shard amortises that, which is what this number is for. |
+| `LAMP_DESIGN_THERMO_CHUNK` | `256` | Primer sets per chunk in the in-process thermo pool. A guess, not a measurement. |
 | `LAMP_DESIGN_SINGLE_CPUS` | `16` | Cores for the single-container thermo pool. |
 | `LAMP_DESIGN_SINGLE_MEMORY_MB` | `32768` | Memory for the single-container path. |
 | `LAMP_DESIGN_ALIGN_THREADS` | `4` | MAFFT threads inside prepare. |
 | `LAMP_DESIGN_MAX_FASTA_BYTES` | `5242880` | Raw FASTA cap — the crude guard before anything is parsed. |
-| `LAMP_DESIGN_MAX_BUDGET` | `50000` | `n_targets × alignment width` cap — the metric ARCHITECTURE.md caps on. **Must track `commands.prepare.DEFAULT_MAX_BUDGET`**; it is passed into `prepare_panel(max_budget=...)`, so prepare is the single enforcement point. |
+| `LAMP_DESIGN_MAX_BUDGET` | `50000` | `n_targets × alignment width` cap. **Must track `commands.prepare.DEFAULT_MAX_BUDGET`**; it is passed into `prepare_panel(max_budget=...)`, so prepare is the single enforcement point. |
 | `LAMP_DESIGN_MAX_CANDIDATE_SETS` | `200000` | Passed to `generate_candidates(max_candidates=...)`, which thins whole anchors at a uniform stride rather than truncating, so hitting it degrades gracefully. |
-
-Caps are enforced in `_validate_request`, which both entrypoints call before
-doing any work, so the two paths are bounded identically. The sequence-count,
-budget and minimum-length checks there are estimated from a single pass over
-the raw FASTA, against the engine's own `commands.prepare.MAX_SEQUENCES`,
-`DEFAULT_MAX_BUDGET` and `DEFAULT_MIN_LENGTH`; `prepare_panel` and
-`generate_candidates` then re-check them authoritatively. The pre-parse figures
-are lower bounds (MAFFT only widens an alignment with gaps), so passing them
-does not excuse the engine's own checks — it just means an absurd upload is
-rejected before MAFFT or generation ever runs.
+| `LAMP_DESIGN_MAX_CONCENTRATIONS` | `4` | Concentrations per request. Each one is another full inference pass over every candidate, so this is the knob that multiplies cost. `deploy/streamlit/_layout.py` mirrors it for its warning; a test keeps the two equal. |
+| `LAMP_DESIGN_HOURLY_GPU_HOURS` | `20` | Above this in the trailing hour, **fan-out is withdrawn** and the run proceeds on one container. Currently unreachable — see "Spend circuit breaker" below. |
+| `LAMP_DESIGN_DAILY_GPU_HOURS` | `50` | Above this in the trailing 24h, runs are **refused**. |
+| `LAMP_DESIGN_TOTAL_GPU_HOURS` | `20` | Above this cumulatively, runs are **refused**. Does not reset on its own. |
+| `LAMP_DESIGN_BUDGET` | `1` | `0` disables the ledger entirely, for a deliberate benchmark. |
+| `LAMP_DESIGN_BUDGET_DICT` | `lamp-design-budget` | `modal.Dict` holding the ledger. Clear it with `modal dict clear`. |
 | `LAMP_DESIGN_WEIGHTS_VOLUME` | `lamp-design-weights` | Volume holding checkpoints. |
-| `LAMP_DESIGN_WEIGHTS_SUBDIR` | `LAMP_experiment_20260905_021750_tp60_A_v0t9` | Checkpoint directory inside that volume. |
+| `LAMP_DESIGN_WEIGHTS_SUBDIR` | `tp60_A_v0t9` | Checkpoint directory inside that volume. Matches the local `~/lamp-weights/` layout so one name works both places. |
 | `LAMP_DESIGN_RESULTS_VOLUME` | `lamp-design-runs` | Volume holding run artifacts. |
 | `LAMP_DESIGN_USE_SECRET` | unset | `1` attaches the `lamp-design-weights` Secret. |
+
+> **Where you set these matters.** Values the *client* evaluates — `gpu=`,
+> `cpu=`, `max_containers=` on the decorators — are read in the shell you run
+> `modal deploy` from. Everything read inside a function body (shard size,
+> chunk size, the budget ceilings) is read from the **container's**
+> environment, so those are forwarded into the image via `.env()`. This bit us:
+> a run with `LAMP_DESIGN_INFER_SHARD_SETS=25` exported locally still sharded
+> at the default 2000 and silently produced one shard. Set them before
+> `modal deploy` either way; the forwarding is what makes it take effect.
+
+## Spend circuit breaker
+
+Three ceilings, recorded into a `modal.Dict` after every run and checked
+before any GPU work. The hourly one **degrades** (fan-out off, single
+container instead); the daily and cumulative ones **refuse**, raising
+`BudgetExceeded` — deliberately not a `ValueError`, so a caller can tell "your
+request is malformed" from "come back later".
+
+Check usage without spending anything:
+
+```bash
+.venv/bin/python -m modal run deploy/modal/app.py --mode budget
+```
+
+**The hourly ceiling is currently dormant, twice over.** `max_containers=10`
+caps consumption at 10 GPU-hours per wall-clock hour, below the 20 GPU-hour
+ceiling; and `LAMP_DESIGN_TOTAL_GPU_HOURS` (20) is not greater than the hourly
+ceiling, so any usage big enough to trip the hourly rule has already tripped
+the cumulative one, which refuses first. The shipped configuration therefore
+refuses rather than degrades. That is the safe direction, but to make graceful
+degradation live, raise the total ceiling above the hourly one.
+
+**What this ledger does not see**, because a budget control trusted further
+than it works is worse than none:
+
+1. Only what goes through `design_fanout` / `design_single_container`.
+   `doctor`, other apps in the workspace, and anything run by hand are
+   invisible to it.
+2. A container killed mid-run (timeout, OOM, preemption) may never reach its
+   record call — so usage is under-counted on exactly the failures that waste
+   the most.
+3. It is advisory, enforced in this file. **Set Modal's own workspace spend
+   limit in the dashboard as well**; that one cannot be bypassed by a bug here.
+
+For scale: the free plan's $30 monthly credit is ~37.5 GPU-hours at the L4
+rate, so the *credit* is a tighter constraint than 50 GPU-hours/day could ever
+be. A full stride-1 design run is ~7.7 GPU-minutes (~$0.09).
+
 
 Timeouts and retries are set per function in `app.py`: thermo chunks retry
 twice (pure function of their inputs, so a retry recomputes the same numbers),
@@ -310,47 +370,77 @@ missing `multiverse`.
 
 ---
 
-## What is not verified
+## What has been verified
 
-Everything in this section needs one real run to settle.
+Confirmed by real runs on 2026-11-01, workspace `sameedmsiddiqui`, total cost
+$0.015 across 8 runs:
 
-1. **The whole thing on Modal.** No account, so: image never built, nothing
-   deployed, no function ever executed. Step 4 is the first thing that will
-   tell you whether any of this works.
+| | result |
+|---|---|
+| Image build | builds; `apt` found `vienna-rna 2.4.17` and `mafft 7.490` in that base image, so `multiverse` is enabled there |
+| `RNAduplex` version assert | passes — 2.4.17, matching the box ΔG was validated against |
+| `doctor` | all tools present, weights resolve, `engine_api_missing: []` |
+| `doctor_gpu` | `cuda_available: true`, `NVIDIA L4`, 5 seed dirs, **ensemble loaded**, `d_input: 19` |
+| torch version skew | **resolved.** The base image's torch 2.4.1+cu121 loads checkpoints written under 2.14.1; `torch.load` default changes in 2.6 did not bite |
+| numpy 2.2.6 on torch 2.4.1 | works |
+| `design_single_container` | real result, 9 sets from 104 candidates |
+| `design_fanout` + `design_shard` | real result, 5 shards merged, **same ranking** as single-container |
+| Remote vs local parity | identical set ids in identical rank order, identical primers, predictions within **2.7e-06 min** (float32 noise across two torch/CUDA builds) |
+| 1×2 condition sweep | `['SS@10000', 'SS@100']` scored remotely, ranked on the high concentration |
+| Streamlit backend seam | `spawn` returns in 0.52 s, poll reports `succeeded`, envelope schema matches, `device: cuda` |
+| The `fork` ordering constraint in `_thermo_pool` | held — prepare → thermo pool → inference, no hang |
+| Spend ledger | records, reports, and survives a corrupt entry |
 
-   What *has* been checked locally, with `modal` stubbed and the real engine
-   underneath: 9 of the 11 entrypoints in `ENGINE_API` resolve and are
-   callable; `_prepare_stage` runs end to end through the real `read_fasta` →
-   `prepare_panel` → `count_candidate_slots` → `generate_candidates`; the
-   panel/primer-set JSON wire formats round-trip real objects exactly; chunk
-   assembly handles full, partial and empty `ThermoTable`s; and request
-   validation rejects every bad input it claims to. See
-   [`../README.md`](../README.md).
-2. **torch version skew.** The base image carries torch 2.4.1+cu121; the dev
-   venv has 2.14.1+cpu. The checkpoints are plain `state_dict`s, which load
-   across that gap, but `torch.load` defaults changed in 2.6. `doctor_gpu`
-   exists to catch this; if the loader objects, bump `TORCH_IMAGE`.
-3. **numpy 2.2.6 on torch 2.4.1.** Pinned to match the dev box. This specific
-   pair is untested; if torch complains at import, either bump the base image or
-   pin `numpy<2` and accept the drift from local.
-4. **apt availability** of both pinned versions inside that base image, and
-   that `multiverse` is enabled there.
-5. **Chunk size and fan-out width** (`256` sets, `50` containers) are guesses.
-   Measure `timing_seconds` from a real run — `prepare` / `thermo` / `infer` are
-   reported separately for exactly this purpose — and retune.
-6. **Whether the GPU is needed at all.** For a ~100K-parameter ensemble, 16 CPU
-   cores may match a T4. If measurement says so, set `gpu=None` on `infer` and
-   `design_single_container` and delete the GPU. The fan-out exists because
-   thermo dominates, not because the model is heavy.
-7. **Polling semantics.** That a not-yet-finished `FunctionCall.get(timeout=0)`
-   raises the builtin `TimeoutError` is from the documented behaviour, not
-   observed here.
-8. **The `fork` ordering constraint** in `_thermo_pool`. The pool forks, and
-   forking after CUDA is initialised hangs, so `design_single_container` runs
-   prepare → thermo pool → inference and inference is the first thing to touch
-   torch. That ordering is correct by construction but has never been run on a
-   GPU container.
-9. **The two missing engine stages**, `thermo.compute_thermo` and
-   `models.predict_tp`. Their names and signatures are this harness's
-   expectation, agreed with nobody yet; `doctor` reports them as missing. See
-   [`../README.md`](../README.md).
+### Bugs this found
+
+Each of these built a clean image and failed only at run time, which is the
+argument for doing step 4 before trusting anything:
+
+1. **`LOCAL_REPO = Path(__file__).resolve().parents[2]`** — fine locally, but
+   in the container the file is `/root/app.py`, whose `parents` is `(/root, /)`.
+   `IndexError` at import killed every function during startup.
+2. **`einops` was never declared** in `pyproject.toml`. It is a module-level
+   import in the vendored S4D kernel, on the production inference path; the dev
+   box had it installed by hand, so every local run and test passed.
+   `tests/test_packaging.py` now compares declared dependencies against actual
+   module-level imports.
+3. **`_concat_thermo` assigned `target_windows` after construction**, but
+   `ThermoTable.__post_init__` validates its shape — so construction always
+   raised first and that line could never have run.
+4. **Container-side env vars were never forwarded**, so documented tunables
+   silently had no effect remotely.
+5. **`params` was never populated** on either Modal path, because
+   `build_design_result` does not fill it in — `commands.design.design` does
+   that itself. A remote `result.json` could not say what produced it.
+
+### Still not verified
+
+1. **A full-scale run.** Everything above used a 4 × 600 nt panel at stride 20
+   (104 candidates). The 7.7-minute / 940,520-prediction figure is from a local
+   L4, not from Modal, and `INFER_SHARD_SETS=2000` has never been exercised at
+   a size where it is the right number.
+2. **Fan-out actually paying off.** Measured on the small input it costs 3.6×
+   *more* GPU-seconds than single-container, because each shard pays container
+   start, weights load and torch init. The crossover point is unmeasured.
+3. **MAFFT on the alignment path.** It is installed in the image (and absent
+   from the dev box), but no run has fed it ragged multi-FASTA input.
+4. **Retry behaviour.** `design_shard` has `retries=1`; no shard has failed.
+5. **A multi-*mix* sweep remotely.** `_validate_request` takes one
+   `master_mix`; concentrations fan out, mixes do not.
+6. **Polling a still-running call.** Every run so far finished inside the
+   first poll interval, so the `TimeoutError`-means-running path is still from
+   the documentation rather than observed.
+7. **`modal.Dict` contention.** The ledger is a read-modify-write, which is
+   not atomic across concurrent shards; with `max_containers=10` a lost update
+   would under-count. Only the orchestrator records, so this is currently
+   moot — but it would matter if shards ever recorded individually.
+
+### An operational trap worth knowing
+
+After `modal deploy`, a **warm container from the previous version can still
+serve calls.** The `params` fix above appeared not to work for one run because
+of this: the call landed on a warm container running the old code, which showed
+up as a suspiciously fast 7.0 s completion against a 175 s cold start. If a
+freshly deployed change seems to have no effect, check whether the run was
+warm before debugging the code. `modal run` builds an ephemeral app and always
+gets fresh containers, so it is the honest way to test a change.

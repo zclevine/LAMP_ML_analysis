@@ -18,6 +18,14 @@ dependencies = [
     "ViennaRNA>=2.6",
     "torch>=2.2",
     "scipy>=1.11",
+    # Required by the vendored S4D kernel (models/lyra/s4d.py), which imports
+    # it at module level and is on the production inference path. It was
+    # missing here until the first real Modal run died on it: this box had it
+    # installed by hand, so every local run worked and the declared dependency
+    # set was quietly incomplete. `fla` and `mamba_ssm` are NOT listed on
+    # purpose -- lyra_base.py imports them inside non-s4d branches only, and
+    # the production config is ssm=s4d.
+    "einops>=0.8",
 ]
 
 [project.optional-dependencies]

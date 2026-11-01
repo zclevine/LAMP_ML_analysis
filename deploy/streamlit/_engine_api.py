@@ -167,7 +167,7 @@ PRIMER_TYPE_ORDER: tuple[str, ...] = tuple(
 
 #: The engine's default sweep: 2 master mixes x 2 concentrations.
 DEFAULT_MASTER_MIXES: tuple[str, ...] = tuple(
-    engine_default("lamp_design.commands.design", "DEFAULT_MASTER_MIXES", ("BST", "SS"))
+    engine_default("lamp_design.commands.design", "DEFAULT_MASTER_MIXES", ("SS",))
 )
 DEFAULT_CONCENTRATIONS: tuple[float, ...] = tuple(
     float(c)

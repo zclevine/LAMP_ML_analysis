@@ -59,12 +59,25 @@ from lamp_design.utils.sequences import read_fasta
 if TYPE_CHECKING:  # pragma: no cover
     from lamp_design.models.inference import LyraEnsemble
 
-#: Master mixes scored by default. The design notes' sweep is 2 mixes x 2
-#: concentrations; ``WS`` is available but is not part of the default sweep.
-DEFAULT_MASTER_MIXES: Tuple[str, ...] = ("BST", "SS")
+#: Master mix scored by default. One mix, not two: ranking only ever uses a
+#: single condition (see `score_sets`), so a second mix quadrupled inference --
+#: 89% of runtime -- without changing which sets come back.
+#:
+#: ``SS`` is the one, on training coverage rather than preference. Across the
+#: curated corpus (170,175 rows in datasets/LAMP/final) the split is
+#: SS 53.7% / BST 38.9% / WS 7.4%, so SS and BST are both well represented.
+#: The tiebreaker is *where*: BST appears in no LASV, Systematic or Borrelia
+#: row, so the held-out pathogen validation in docs/ARCHITECTURE.md (LASV
+#: ROC-AUC 0.875, Borrelia 0.984) contains no BST measurements at all. Ranking
+#: under SS is ranking under the only mix those numbers actually cover.
+#:
+#: ``BST`` and ``WS`` remain selectable with ``--master-mix``.
+DEFAULT_MASTER_MIXES: Tuple[str, ...] = ("SS",)
 
 #: Template concentrations scored by default, in copies per reaction: one
-#: comfortable and one near the limit of detection.
+#: comfortable and one near the limit of detection. Both are scored for every
+#: candidate; the higher one ranks (`_ranking_condition`) and the lower one is
+#: the robustness column, which is the question a diagnostic actually turns on.
 DEFAULT_CONCENTRATIONS: Tuple[float, ...] = (10_000.0, 100.0)
 
 #: Rows per forward pass, same on CPU and GPU.
