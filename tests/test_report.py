@@ -18,6 +18,7 @@ import pytest
 
 from lamp_design import report
 from lamp_design.report import (
+    FAST_TP_FLOOR_MINUTES,
     DEFAULT_MIN_SEPARATION_BP,
     DEFAULT_N_SETS,
     DEFAULT_TP_THRESHOLD_MINUTES,
@@ -931,7 +932,13 @@ def test_summary_text_reports_the_funnel_counts_and_warnings(tmp_path: Path):
 
     assert "LAMP primer design summary" in text
     assert "BST@1000" in text
-    assert "LOWER is faster" in text
+    # The summary now leads with the ranking rather than a Tp value, because
+    # predicted Tp legitimately goes negative (the model is trained with
+    # regress_tp_cutoff = -100) and a portal printing "-5.46 min" as a
+    # duration reads as a bug. The rank is the output; Tp appears banded.
+    assert "a RANKING" in text
+    assert "Rank 1 is the fastest" in text
+    assert f"<{FAST_TP_FLOOR_MINUTES:g} min" in text
     assert "Candidate funnel" in text
     for stage in ("anchors", "geometries", "dimer_filter", FUNNEL_SCORED, FUNNEL_RETURNED):
         assert stage in text
@@ -1075,3 +1082,55 @@ def test_empty_panel_and_empty_result_still_render(tmp_path: Path):
     assert payload["ranking"]["ranking_condition"] is None
     assert "(unknown)" in paths["summary_txt"].read_text()
     assert format_summary(result).startswith("LAMP primer design summary")
+
+
+# ---------------------------------------------------------------------------
+# format_tp
+#
+# Predicted Tp goes negative by design (the model is trained with
+# regress_tp_cutoff = -100), so the user-facing string is banded. The rank is
+# the output; the number is context.
+# ---------------------------------------------------------------------------
+
+
+def test_fast_predictions_are_banded_not_printed():
+    from lamp_design.report import format_tp
+
+    assert format_tp(-5.46) == "<5 min"
+    assert format_tp(0.0) == "<5 min"
+    assert format_tp(4.99) == "<5 min"
+
+
+def test_predictions_above_the_floor_keep_their_value():
+    from lamp_design.report import format_tp
+
+    assert format_tp(5.0) == "5.0 min"
+    assert format_tp(12.74) == "12.7 min"
+    assert format_tp(59.9) == "59.9 min"
+
+
+def test_a_missing_prediction_is_not_rendered_as_a_number():
+    from lamp_design.report import format_tp
+
+    assert format_tp(None) == "n/a"
+
+
+def test_no_negative_duration_can_reach_a_user_facing_string():
+    """The specific thing this exists to prevent."""
+    from lamp_design.report import format_tp
+
+    for value in (-100.0, -42.0, -5.46, -1e-9):
+        rendered = format_tp(value)
+        assert "-" not in rendered, f"{value} rendered as {rendered!r}"
+
+
+def test_the_band_matches_the_measured_quartile():
+    """5 minutes is where the data puts it, not a round number.
+
+    p25 of measured Tp in the curated corpus is 5.06 min (p0.1 = 1.76,
+    p5 = 2.70), so the band is almost exactly "the fastest quartile of
+    everything ever measured".
+    """
+    from lamp_design.report import FAST_TP_FLOOR_MINUTES
+
+    assert FAST_TP_FLOOR_MINUTES == 5.0

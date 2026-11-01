@@ -156,6 +156,32 @@ def encode_pairs(
     return rows, kept
 
 
+def _dedup_key(thermo: ThermoTable, pair_idx: int) -> tuple:
+    """Everything :func:`encode_row` reads for one pair, as a hashable key.
+
+    Provably sufficient: ``encode_pairs`` builds row ``i`` from exactly four
+    things -- the primer sequences of ``thermo.set_ids[i]``, the eight strings
+    in ``thermo.target_windows[i]``, and the standardized
+    ``thermo.values[i]`` / ``thermo.globals_[i]`` -- plus the condition and the
+    standardizer, which are fixed across the rows being grouped. Two pairs
+    agreeing on all four therefore encode to the same tensor and predict the
+    same number.
+
+    ``set_id`` stands in for the primer sequences, since the set determines
+    them. That makes the key cheap but confines deduplication to one candidate
+    set. Measured cost of that choice: none. On the H5N1 demo panel, grouping
+    globally and grouping within a set both give 26,495 distinct rows out of
+    75,114, because two *different* sets essentially never agree on windows and
+    physics at once.
+    """
+    return (
+        thermo.set_ids[pair_idx],
+        tuple(thermo.target_windows[pair_idx].tolist()),
+        thermo.values[pair_idx].tobytes(),
+        thermo.globals_[pair_idx].tobytes(),
+    )
+
+
 def predict_tp(
     thermo: ThermoTable,
     primer_sets: Iterable[PrimerSet] | Mapping[str, PrimerSet],
@@ -168,6 +194,7 @@ def predict_tp(
     clip: bool = True,
     batch_size: int = 512,
     pair_chunk: int = PAIR_CHUNK,
+    dedup: bool = True,
 ) -> List[Prediction]:
     """Predicted Tp for every (pair, condition).
 
@@ -187,6 +214,26 @@ def predict_tp(
     and an L4 GPU; 4096 and 16384 were ~7% slower, and the GPU never exceeded
     29% utilization, so the constraint is encoding throughput rather than batch
     launch overhead. See ``commands.design.BATCH_SIZE_CPU``.
+
+    ``dedup`` groups pairs whose model input is identical and runs each group
+    once -- see :func:`_dedup_key` for why the key is sufficient. It pays
+    because a panel is usually closely related sequences: one candidate set
+    reads only ~170 nt of each target, and two genomes agreeing over that
+    stretch give a byte-identical tensor, since the master mix and
+    concentration are the *same condition* for every target. Measured on the
+    H5N1 demo panel, 75,114 pairs collapse to 26,495 rows (**2.84x**) and the
+    inference stage goes 63.0s -> 23.4s on an L4, a **2.69x** speedup. The
+    factor is panel-dependent by nature: near-clonal input gains a lot, a
+    diverse panel approaches 1x and loses only a hash per row.
+
+    **Exact in arithmetic, not bit-exact in floating point.** Grouping does not
+    change what any row computes, but it changes how many rows there are, hence
+    the batches, hence the order of float32 reductions inside them. Measured
+    against ``dedup=False`` on the demo panel: max |dTp| **7.4e-04 min** on an
+    L4 and **3.8e-06 min** on CPU, on predictions spanning 0-60 min. For scale,
+    the GPU-vs-CPU difference this pipeline already accepts is 5.8e-04 min, so
+    this is the same order as existing device noise. The returned top 20 was
+    identical in id and order. Set ``dedup=False`` to force every pair through.
     """
     if ensemble is None:
         ensemble = LyraEnsemble.load(weights, device=device)
@@ -200,23 +247,60 @@ def predict_tp(
     out: List[Prediction] = []
     for condition in conditions:
         for start in range(0, n_pairs, pair_chunk):
-            chunk = range(start, min(start + pair_chunk, n_pairs))
+            chunk = list(range(start, min(start + pair_chunk, n_pairs)))
+
+            if dedup:
+                # Group first, encode and predict one member per group. Groups
+                # are built per chunk, not globally, so peak memory stays the
+                # property `pair_chunk` exists to bound.
+                groups: Dict[tuple, List[int]] = {}
+                for pair_idx in chunk:
+                    groups.setdefault(_dedup_key(thermo, pair_idx), []).append(pair_idx)
+                encode_indices = [members[0] for members in groups.values()]
+            else:
+                groups = {}
+                encode_indices = chunk
+
             rows, kept = encode_pairs(
-                thermo, primer_sets, condition, standardizer, indices=chunk
+                thermo, primer_sets, condition, standardizer, indices=encode_indices
             )
             if not rows:
                 continue
             mean, std = ensemble.predict(
                 rows, pad_mode=pad_mode, clip=clip, batch_size=batch_size
             )
-            for slot, pair_idx in enumerate(kept):
+
+            # pair index -> (tp, std). Built first, then drained in chunk order,
+            # so deduplication cannot reorder the output: callers compare these
+            # lists against non-deduplicated runs.
+            scored: Dict[int, Tuple[float, float]] = {}
+            slot_of = {pair_idx: slot for slot, pair_idx in enumerate(kept)}
+            if dedup:
+                for members in groups.values():
+                    slot = slot_of.get(members[0])
+                    # A representative that failed to encode means the whole
+                    # group fails: the members are identical by construction,
+                    # so none of them could have encoded either.
+                    if slot is None:
+                        continue
+                    value = (float(mean[slot]), float(std[slot]))
+                    for pair_idx in members:
+                        scored[pair_idx] = value
+            else:
+                for pair_idx, slot in slot_of.items():
+                    scored[pair_idx] = (float(mean[slot]), float(std[slot]))
+
+            for pair_idx in chunk:
+                hit = scored.get(pair_idx)
+                if hit is None:
+                    continue
                 out.append(
                     Prediction(
                         set_id=thermo.set_ids[pair_idx],
                         target_name=thermo.target_names[pair_idx],
                         condition=condition,
-                        tp_minutes=float(mean[slot]),
-                        tp_std=float(std[slot]),
+                        tp_minutes=hit[0],
+                        tp_std=hit[1],
                     )
                 )
     return out

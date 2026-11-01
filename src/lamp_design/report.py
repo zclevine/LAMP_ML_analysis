@@ -621,6 +621,36 @@ def _conc(value: Any) -> str:
     return f"{number:g}"
 
 
+#: Below this many minutes a predicted Tp is reported as a band, not a number.
+#:
+#: The model is trained on a target floored at -100 (``regress_tp_cutoff``), so
+#: its output legitimately goes negative -- a fitted amplification curve whose
+#: threshold crossing extrapolates back past t=0. Printing "-5.46 min" as a
+#: *time* invites the reader to call it impossible, when what it means is
+#: "faster than anything in the training data".
+#:
+#: 5 minutes is where the data puts the boundary, not a round number: in the
+#: curated corpus the 0.1st percentile of measured Tp is 1.76 min, the 5th is
+#: 2.70, and the 25th is **5.06**. So "< 5 min" is almost exactly "in the
+#: fastest quartile of everything we ever measured", and the model cannot
+#: resolve within it in a way a user should act on.
+FAST_TP_FLOOR_MINUTES: float = 5.0
+
+
+def format_tp(minutes: Optional[float]) -> str:
+    """A predicted Tp as a user-facing string.
+
+    Banded below :data:`FAST_TP_FLOOR_MINUTES`, because the ordering inside
+    that band is what the *rank* is for. The raw value stays in the CSV under
+    its own column, so nothing is lost and a ranking stays auditable.
+    """
+    if minutes is None:
+        return "n/a"
+    if minutes < FAST_TP_FLOOR_MINUTES:
+        return f"<{FAST_TP_FLOOR_MINUTES:g} min"
+    return f"{minutes:.1f} min"
+
+
 def _slowest(per_target_tp: Mapping[str, float]) -> Tuple[Optional[str], Optional[float]]:
     """The worst (highest) predicted Tp and its target -- the problem sequence."""
     if not per_target_tp:
@@ -947,8 +977,14 @@ def format_summary(
     lines.append("")
     lines.append(f"Ranking condition : {ranking_condition if ranking_condition else '(unknown)'}")
     lines.append(
-        "Speed metric      : mean predicted Tp across targets, in MINUTES "
-        "(LOWER is faster, so rank 1 is the fastest)"
+        "Output            : a RANKING. Rank 1 is the fastest predicted set; "
+        "the rank is the result, not the Tp value."
+    )
+    lines.append(
+        f"Predicted Tp      : shown as '<{FAST_TP_FLOOR_MINUTES:g} min' below "
+        f"{FAST_TP_FLOOR_MINUTES:g} minutes -- that band is the fastest "
+        f"quartile of all measured data (p25 = 5.06 min) and the model does "
+        f"not resolve inside it. Raw scores are in the sets CSV."
     )
     lines.append(
         f"Inclusivity       : fraction of the {n_panel} panel target(s) with "
@@ -979,16 +1015,16 @@ def format_summary(
     lines.append("")
 
     if result.scored_sets:
-        lines.append("Top sets (rank: set_id @ anchor -- mean Tp / inclusivity / slowest target)")
-        lines.append("-" * 74)
+        lines.append("Ranked sets (rank: set_id @ anchor -- mean Tp / inclusivity / slowest target)")
+        lines.append("-" * 78)
         for rank, scored in enumerate(result.scored_sets[:max_sets_shown], start=1):
             slowest_name, slowest_tp = _slowest(scored.per_target_tp)
             slowest = (
-                f"{slowest_name} at {slowest_tp:.1f} min" if slowest_name else "n/a"
+                f"{slowest_name} at {format_tp(slowest_tp)}" if slowest_name else "n/a"
             )
             lines.append(
                 f"  {rank:>3}: {scored.primer_set.set_id} @ {scored.primer_set.anchor} "
-                f"-- {scored.speed_score:.2f} min mean Tp / "
+                f"-- {format_tp(scored.speed_score)} mean Tp / "
                 f"{scored.inclusivity:.0%} inclusivity / slowest {slowest}"
             )
         remaining = len(result.scored_sets) - max_sets_shown

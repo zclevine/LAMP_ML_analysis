@@ -770,3 +770,71 @@ def test_the_demo_panel_is_within_the_engines_input_limits():
             f"{relative} is {len(records)} x {longest} = "
             f"{len(records) * longest:,}, over the {_engine_api.MAX_BUDGET:,} budget"
         )
+
+
+# ---------------------------------------------------------------------------
+# The run-page scope sentence
+# ---------------------------------------------------------------------------
+
+
+def _portal():
+    import sys
+
+    sys.path.insert(0, str(APP_DIR))
+    import app as portal  # noqa: PLC0415
+
+    return portal
+
+
+def test_the_scope_sentence_names_candidates_targets_and_concentrations():
+    scope = _portal().describe_scope(
+        {
+            "candidates": 24033,
+            "conditions": 2,
+            "n_targets": 10,
+            "n_mixes": 1,
+            "n_concs": 2,
+            "predictions": 480660,
+            "seconds": 210.0,
+        }
+    )
+    assert "24,033" in scope and "candidate primer sets" in scope
+    assert "10" in scope and "targets" in scope
+    assert "2" in scope and "concentrations" in scope
+    assert "480,660" in scope
+    # One master mix must not be announced -- it would read as a parameter the
+    # user chose rather than the default it is.
+    assert "master mix" not in scope
+
+
+def test_the_scope_sentence_mentions_mixes_only_when_there_is_more_than_one():
+    portal = _portal()
+    many = portal.describe_scope(
+        {
+            "candidates": 100,
+            "conditions": 6,
+            "n_targets": 3,
+            "n_mixes": 3,
+            "n_concs": 2,
+            "predictions": 1800,
+            "seconds": 1.0,
+        }
+    )
+    assert "3** master mixes" in many or "master mixes" in many
+
+
+def test_the_scope_sentence_singularises():
+    scope = _portal().describe_scope(
+        {
+            "candidates": 5,
+            "conditions": 1,
+            "n_targets": 1,
+            "n_mixes": 1,
+            "n_concs": 1,
+            "predictions": 5,
+            "seconds": 0.1,
+        }
+    )
+    assert "1 target " in scope or "1** target " in scope
+    assert "targets" not in scope
+    assert "concentrations" not in scope

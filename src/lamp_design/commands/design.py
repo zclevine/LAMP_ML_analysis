@@ -284,7 +284,23 @@ def design(
         max_candidates=max_candidates,
     )
     timings["generation_s"] = time.perf_counter() - t
-    say("generation", f"{len(candidates):,} candidate sets")
+    # State the size of the search up front. Deduplication later skips
+    # recomputing byte-identical inputs, so every candidate named here really
+    # is evaluated against every target -- the sentence stays true.
+    n_concs = len({c.target_conc for c in conditions})
+    n_mixes = len({c.master_mix for c in conditions})
+    scope = [
+        f"{len(candidates):,} candidate sets",
+        f"{panel.n_targets} target{'s' if panel.n_targets != 1 else ''}",
+    ]
+    if n_mixes > 1:
+        scope.append(f"{n_mixes} master mixes")
+    scope.append(f"{n_concs} concentration{'s' if n_concs != 1 else ''}")
+    say(
+        "generation",
+        f"checking {', '.join(scope[:-1])} and {scope[-1]} "
+        f"-- {len(candidates) * panel.n_targets * len(conditions):,} model evaluations",
+    )
 
     t = time.perf_counter()
     thermo = compute_thermo(candidates, panel, threads=threads)

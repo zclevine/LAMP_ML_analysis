@@ -526,9 +526,43 @@ def _estimate(params: dict) -> dict[str, float | int] | None:
     return {
         "candidates": candidates,
         "conditions": conditions,
+        "n_targets": check.n_seqs,
+        "n_mixes": max(1, len(params["master_mixes"])),
+        "n_concs": max(1, len(params["concentrations"])),
         "predictions": predictions,
         "seconds": predictions / rate,
     }
+
+
+def describe_scope(estimate: dict) -> str:
+    """One sentence naming the size of the search, for the run page.
+
+    Says what is actually being searched, in the user's own terms, so the run
+    is legible while it is happening rather than only in the funnel afterwards.
+    Every number is the real one the engine will use -- candidates is
+    ``count_candidate_slots``' arithmetic, before the GC screen trims it, so
+    this is an upper bound and the funnel in the result will be slightly lower.
+
+    Deduplication does not belong in this sentence: it skips *recomputing*
+    inputs that are byte-identical, so every candidate named here really is
+    evaluated against every target.
+    """
+    n_concs = int(estimate["n_concs"])
+    n_mixes = int(estimate["n_mixes"])
+    targets = int(estimate["n_targets"])
+    parts = [
+        f"**{int(estimate['candidates']):,}** candidate primer sets",
+        f"**{targets}** target{'s' if targets != 1 else ''}",
+    ]
+    if n_mixes > 1:
+        parts.append(f"**{n_mixes}** master mixes")
+    parts.append(
+        f"**{n_concs}** concentration{'s' if n_concs != 1 else ''}"
+    )
+    return (
+        "Checking " + ", ".join(parts[:-1]) + f" and {parts[-1]}"
+        f" — **{int(estimate['predictions']):,}** model evaluations."
+    )
 
 
 def _render_estimate(params: dict) -> None:
@@ -872,6 +906,13 @@ def _page_run() -> None:
             st.error(message)
     for message in cautions:
         st.warning(message)
+
+    # The scope of the search, stated before and during the run. Shown even
+    # while running, so a long job keeps saying what it is doing.
+    if not blockers:
+        scope = _estimate(_layout.init_params())
+        if scope is not None:
+            st.info(describe_scope(scope))
 
     left, right = st.columns(2)
     with left:
