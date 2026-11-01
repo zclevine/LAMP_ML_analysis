@@ -124,7 +124,11 @@ def test_gapped_window_is_dropped_not_fudged():
 @requires_weights
 def test_full_pipeline_produces_ranked_designs(tmp_path):
     from lamp_design.models.bridge import mismatch_map, predict_tp
-    from lamp_design.models.inference import LyraEnsemble
+    from lamp_design.models.inference import (
+        TP_CLIP_MAX,
+        TP_CLIP_MIN,
+        LyraEnsemble,
+    )
     from lamp_design.report import build_design_result, write_outputs
 
     panel = synthetic_panel(n_targets=3, length=700)
@@ -141,7 +145,14 @@ def test_full_pipeline_produces_ranked_designs(tmp_path):
 
     tps = np.array([p.tp_minutes for p in preds])
     assert np.isfinite(tps).all()
-    assert (tps >= 0).all() and (tps <= 60).all(), "clipped predictions left the trained range"
+    # The trained range is [regress_tp_cutoff, tp_censor_at] = [-100, 60], not
+    # [0, 60]. This assertion previously hardcoded 0 as the floor while calling
+    # it "the trained range", which is the same mistake TP_CLIP_MIN itself made
+    # -- negative Tp is in distribution (the ground-truth labels reach -4.611).
+    # Asserted against the constants so the two cannot drift apart again.
+    assert (tps >= TP_CLIP_MIN).all() and (tps <= TP_CLIP_MAX).all(), (
+        "clipped predictions left the trained range"
+    )
 
     result = build_design_result(
         preds,

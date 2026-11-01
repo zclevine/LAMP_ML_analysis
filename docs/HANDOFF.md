@@ -168,11 +168,18 @@ hit this; the demo panel is built from the 47 that do not.
 
 ## Known issues, in the order they would bite you
 
-1. **Predictions clamp at 0.00 min.** `TP_CLIP_MIN = 0.0`, but the training
-   labels reach −4.6 and zero never occurs in them. ~18% of returned
-   predictions sit exactly at the floor, so the fastest candidates tie
-   artificially and their order among themselves is arbitrary. Ranking on the
-   unclipped value is the fix; it is a pending decision, not an oversight.
+1. **Predicted Tp can be negative, and that is correct.** The model was
+   trained with `regress_tp_cutoff = -100`, and the ground-truth `tp` labels
+   reach −4.611 — negative measured Tp is an artifact of extrapolating a fitted
+   amplification curve's threshold crossing back past t=0, not a physical
+   claim. So a top set may report e.g. −5.46 min, meaning "faster than
+   anything in the training data" (the 0.1st percentile of real measurements
+   is 1.76 min). Treat it as a score, not a duration. Whether the UI should
+   display it as `<2 min` instead is an open presentation question.
+
+   This was a bug until 2026-11-01: `TP_CLIP_MIN` was `0.0`, which flattened
+   in-distribution output into ties and **dropped the model's own top-ranked
+   set out of the returned 20 entirely**.
 2. **No off-target / specificity screening.** Accepted for v1. A reviewer will
    ask.
 3. **No dimer/hairpin ΔG filter.** Settled in `ARCHITECTURE.md`, not yet

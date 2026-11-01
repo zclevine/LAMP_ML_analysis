@@ -59,9 +59,36 @@ from lamp_design.models.lyra.lyra_base import Lyra
 #: Seeds of the shipped ensemble, in the order the training config lists them.
 ENSEMBLE_SEEDS: Tuple[int, ...] = (0, 1, 2, 3, 42)
 
-#: Training censored Tp at 60 min, so predictions outside [0, 60] are
-#: extrapolation past anything the model ever saw.
-TP_CLIP_MIN = 0.0
+#: Bounds of the range the model was *trained* to emit, from the production
+#: training config (lyra/export/New_Lyra_code/command_line_args.json):
+#:
+#:     regress_tp_cutoff       = -100     <- the regression target floor
+#:     tp_censor_at            =   60.0   <- right-censoring
+#:     tp_cutoff_for_positive  = -100
+#:     log_tp_transform        = False
+#:
+#: ``TP_CLIP_MIN`` was 0.0, and that was a bug, not a convention. The claim
+#: above it -- "predictions outside [0, 60] are extrapolation past anything the
+#: model ever saw" -- was false at the bottom end: the ground-truth ``tp``
+#: column in datasets/LAMP/final reaches **-4.611**, and training floors the
+#: target at -100, so negative predictions are squarely in distribution.
+#: (Negative measured Tp is an artifact of fitting an amplification curve and
+#: extrapolating its threshold crossing back past t=0, not a physical claim.)
+#:
+#: Clipping at 0 was not cosmetic, because these values are *ranked* and
+#: clipping is not monotone at the boundary -- it is many-to-one, so it creates
+#: ties. Measured on examples/H5N1_HA_demo.fasta at stride 1:
+#:
+#:   * 3 of the returned top 20 tied at exactly 0.0, ordered arbitrarily
+#:   * 5 of the 20 returned sets changed identity
+#:   * the unclipped best set (-5.46 min) did not appear in the clipped top 20
+#:     *at all*: flattened to 0.0 it tied with two others and lost the
+#:     tiebreak
+#:
+#: So the floor was discarding the model's own top pick. 60.0 stays: it matches
+#: ``tp_censor_at``, above which a reaction is "did not amplify" and the
+#: ordering genuinely carries no information.
+TP_CLIP_MIN = -100.0
 TP_CLIP_MAX = 60.0
 
 _SEED_DIR_RE = re.compile(r"^seed_(\d+)$")
