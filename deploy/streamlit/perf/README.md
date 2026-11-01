@@ -5,13 +5,52 @@
 > optional variant plus the measurements that justify it, so the decision can
 > be made rather than inherited.
 
-The complaint is real and it is not specific to this app: **PrimerCast in
-production has the same problem, from the same two causes.** Both were measured
-against the live service, not inferred.
+The complaint is real and not specific to this app. The observed figures, from
+the production service:
+
+| | |
+|---|---|
+| fresh browser, cold cache | **~21 s** |
+| same browser again | **~3 s** |
+
+The ~3 s is the floor with every asset already cached: websocket handshake,
+one script run, render. So **~18 s is what a first visit pays on top**, and the
+job of this document is to say what that 18 s is actually made of.
+
+### Ranked by what it is likely to be
+
+Measured from a GCP VM in the same region as the service, so network is close
+to ideal and what remains is structural:
+
+| suspect | measured | likely share of the 18 s |
+|---|---|---|
+| **cold start** (`min_instances = 0`) | not directly measurable from outside | **probably most of it** |
+| **68 separate requests** | 4.50 s of summed per-request latency | seconds, worse on a high-latency link |
+| **3 MB of JS to parse** | client CPU, not network | seconds on a modest laptop |
+| **uncompressed bytes** | 3,098 KB vs 732 KB gzipped | 0.8 s at 25 Mbps, 3.9 s at 5 Mbps |
+
+**Compression is the smallest of the four on a decent connection**, which is
+the opposite of where I started. It is still worth doing — it is free once a
+proxy or CDN is in place — but `min_instances = 1` is the change to make first,
+and it is one line.
+
+### The 30-second test that settles it
+
+Cold start and asset cost are indistinguishable from the outside, but not from
+a browser:
+
+1. Load the site once so the Cloud Run instance is warm.
+2. Immediately open DevTools, tick **Disable cache**, and hard-reload.
+
+That is a first-visit asset load against a *warm* instance.
+
+- Still ~18-21 s → it is assets and JS parse. Compression and the proxy help.
+- Drops to ~5 s → the 21 s was mostly **cold start**. Set `min_instances = 1`
+  and the rest is a rounding error.
 
 ---
 
-## Cause 1: the frontend ships uncompressed (76% waste)
+## Cause 1: the frontend ships uncompressed (76% of bytes, but see the ranking above)
 
 Measured on Streamlit 1.65.0, which is the build PrimerCast also runs — same
 asset hash, `index.CKCTizkM.js`:
@@ -145,9 +184,15 @@ pays a 1.76s torch import. That part is already right and worth not breaking.
 
 | change | effort | effect |
 |---|---|---|
-| `min_instances = 1` | one Terraform line | removes cold start, the likely dominant cost |
-| Cloud CDN in front | infra config | −76% first-load bytes, no container cost |
-| `Dockerfile.proxied` | use this image | −76% first-load bytes, ~30 MB image, 2 processes |
+| **`min_instances = 1`** | one Terraform line | removes cold start — **do this first** |
+| Cloud CDN in front | infra config | −76% bytes, no container cost |
+| `Dockerfile.proxied` | use this image | −76% bytes, ~30 MB image, 2 processes |
 
-Do the first one regardless. Then one of the other two, whichever the project
-already supports.
+**Do `min_instances = 1` regardless**, then run the browser test above before
+spending effort on the other two — it tells you whether they are worth it for
+this audience's connections. Expect it to matter a lot for someone on hotel
+wifi and barely at all on campus.
+
+Both compression options leave the 68-request count and the 3 MB JS parse
+untouched. Those are Streamlit's frontend, not something this repo can fix;
+the only lever on them is not using Streamlit, which is not worth it here.

@@ -172,6 +172,16 @@ is an error with the position named. Silently substituting a base would change
 the design without telling you. Six of the 53 sequences in PrimerCast's `H5.fa`
 hit this; the demo panel is built from the 47 that do not.
 
+## The portal is slow on a first visit
+
+~21 s on a fresh browser, ~3 s on a repeat. Attribution, the fix, and a
+30-second browser test that identifies which cause dominates are in
+[`deploy/streamlit/perf/README.md`](../deploy/streamlit/perf/README.md).
+
+Short version: **set `min_instances = 1`** — PrimerCast ships
+`cloud_run_min_instances = 0`, so for a low-traffic tool most visits are cold
+starts. Everything else (compression, request count, JS parse) is smaller.
+
 ## Known issues, in the order they would bite you
 
 1. **Predicted Tp can be negative, and that is correct.** The model was
