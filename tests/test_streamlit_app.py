@@ -798,9 +798,11 @@ def test_the_scope_sentence_names_candidates_targets_and_concentrations():
             "seconds": 210.0,
         }
     )
-    # Rounded on purpose: the pre-run figure is an upper bound that edge
-    # effects and the GC screen then reduce, so quoting it to the unit invites
-    # "why isn't it length x geometries?". The exact count is in the funnel.
+    # Rounded on purpose, and counted as the full positions x layouts grid:
+    # sets that would overrun the template end are candidates generation
+    # rejects, exactly like the GC screen's. Counting them keeps the number
+    # predictable (length x layouts) instead of inviting "why isn't it
+    # 25,000?". The exact surviving count is in the funnel.
     assert "~24,000" in scope and "candidate primer sets" in scope
     assert "10" in scope and "targets" in scope
     assert "2" in scope and "concentrations" in scope
@@ -852,3 +854,15 @@ def test_the_pre_run_candidate_count_is_rounded():
     # Small counts are exact: there is nothing misleading about "5".
     assert round_candidates(5) == "5"
     assert round_candidates(999) == "999"
+
+
+def test_the_candidate_estimate_is_length_times_layouts():
+    """The number a user can predict, with no edge-case deduction.
+
+    5 kb at stride 1 with 5 layouts per position must read 25,000, not 24,033.
+    Sets overrunning the template end are candidates generation rejects, and
+    counting them is what makes the figure intuitive.
+    """
+    portal = _portal()
+    assert portal._round_candidates(5000 * 5) == "~25,000"
+    assert portal._round_candidates(1751 * 5) == "~9,000"

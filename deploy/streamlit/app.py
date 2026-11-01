@@ -515,7 +515,14 @@ def _estimate(params: dict) -> dict[str, float | int] | None:
         if params["use_input_conditions"]:
             conditions = 1
     else:
-        anchors = max(0, (check.max_len - MIN_TARGET_LENGTH) // params["stride"] + 1)
+        # Every tiled position x every layout, with no deduction for sets that
+        # would overrun the template end. Those ARE candidates -- generation
+        # considers and rejects them, exactly like the GC screen does -- so
+        # counting them is as truthful as not, and it is the definition a user
+        # can predict: sequence length x layouts per position. Subtracting the
+        # edge cases produced a number (24,033 for 5 kb) whose only effect was
+        # to make people ask why it was not 25,000.
+        anchors = max(0, check.max_len // params["stride"])
         candidates = min(anchors * params["n_geometries"], MAX_CANDIDATE_SETS)
     predictions = candidates * check.n_seqs * conditions
     rate = (
@@ -537,18 +544,14 @@ def _estimate(params: dict) -> dict[str, float | int] | None:
 def _round_candidates(n: int) -> str:
     """A pre-run candidate count, rounded, because precision here misleads.
 
-    The exact figure is an *upper bound* that two separate effects then reduce,
-    and quoting it to the unit invites the reader to ask why it is not
-    ``length x geometries``:
+    This is the whole ``positions x layouts`` grid, which generation then
+    filters -- sets that would overrun the template end, then any set with a
+    primer outside 20-80% GC (~5% on an even-GC panel, more on a skewed one).
+    Rounding says "this is the size of the search", which is what the number is
+    for, without implying a precision that the subsequent filtering removes.
 
-      * a set spanning S bases cannot start in the last S-1 positions, so five
-        geometries over 5 kb give ~24,100 slots rather than 25,000; then
-      * the GC screen drops whatever fails 20-80% on any of the eight primers,
-        a further ~5% on an even-GC panel and much more on a skewed one.
-
-    So the honest pre-run number is approximate by nature. The *exact* count
-    is reported after generation, in the funnel, where it is a measurement
-    rather than an estimate.
+    The *exact* surviving count is reported after generation, in the funnel,
+    where it is a measurement rather than an estimate.
     """
     if n < 1000:
         return f"{n:,}"
