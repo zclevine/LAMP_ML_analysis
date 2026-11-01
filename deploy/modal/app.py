@@ -1797,8 +1797,10 @@ def design_single_container(request: dict) -> dict:
 # remote exception. deploy/streamlit/app.py uses exactly that; the README
 # spells it out. `--mode sync` below is the synchronous form for small jobs.
 #
-# An HTTP front door (@modal.fastapi_endpoint + fastapi in the image) is
-# deliberately NOT built: every current caller is Python.
+# An HTTP front door IS now built, at the end of this file, behind
+# LAMP_DESIGN_HTTP=1. It exists for one caller who is not Python-with-a-Modal-
+# token: a collaborator deploying the portal in their own infrastructure. See
+# the "HTTP front door" section and docs/HANDOFF.md.
 # ---------------------------------------------------------------------------
 
 
@@ -1885,3 +1887,153 @@ def main(
         f"full artifacts: modal volume get {RESULTS_VOLUME} {envelope['run_id']}/ ./",
         flush=True,
     )
+
+
+# ---------------------------------------------------------------------------
+# HTTP front door
+#
+# Exists so a collaborator can run the portal without a Modal token. A Modal
+# token is workspace-scoped: handing one to a third party hands over a key to
+# the whole account -- every app, every Volume, every Secret, and the ability
+# to spend. An API key checked here is scoped to this one function, is
+# rotatable without touching their deployment, and keeps the weights inside
+# this workspace.
+#
+# Their container then needs only Streamlit and `requests`, not the Modal SDK,
+# torch, ViennaRNA or the checkpoints. See docs/HANDOFF.md, shape A.
+#
+# SETUP (once):
+#   modal secret create lamp-design-api --from-literal LAMP_DESIGN_API_KEYS="$(openssl rand -hex 32)"
+#   LAMP_DESIGN_HTTP=1 modal deploy deploy/modal/app.py
+#
+# Rotation is additive: put both keys in the secret, update callers, drop the
+# old one. The variable is a comma-separated list for exactly that reason.
+# ---------------------------------------------------------------------------
+
+#: Opt-in, because an unauthenticated public URL for a GPU function is the one
+#: mistake here that costs real money. Deploying without this simply does not
+#: create the endpoint.
+HTTP_ENABLED = os.environ.get("LAMP_DESIGN_HTTP") == "1"
+
+#: Secret holding LAMP_DESIGN_API_KEYS. Separate from the weights secret so the
+#: two rotate independently.
+API_SECRET_NAME = os.environ.get("LAMP_DESIGN_API_SECRET", "lamp-design-api")
+
+HTTP_SECRETS: list = (
+    [modal.Secret.from_name(API_SECRET_NAME)] + SECRETS if HTTP_ENABLED else []
+)
+
+
+def _authorized(request_key: Optional[str]) -> bool:
+    """Constant-time check of a presented key against the configured set.
+
+    Fails CLOSED: no configured keys means no access. That is the opposite of
+    the budget ledger's fail-open, and deliberately so -- a broken ledger
+    should not stop legitimate work, but a missing key list must never open
+    the door.
+    """
+    import hmac
+
+    configured = [
+        key.strip()
+        for key in os.environ.get("LAMP_DESIGN_API_KEYS", "").split(",")
+        if key.strip()
+    ]
+    if not configured or not request_key:
+        return False
+    # compare_digest on every candidate, and `any` over the results rather
+    # than short-circuiting, so the time taken does not reveal which key
+    # matched or how many are configured.
+    return any([hmac.compare_digest(key, request_key) for key in configured])
+
+
+def _bearer(headers: Any) -> Optional[str]:
+    """The presented key, from `Authorization: Bearer ...` or `X-API-Key`."""
+    auth = headers.get("authorization") or headers.get("Authorization") or ""
+    if auth.lower().startswith("bearer "):
+        return auth[7:].strip()
+    return headers.get("x-api-key") or headers.get("X-API-Key")
+
+
+if HTTP_ENABLED:
+
+    @app.function(timeout=120, secrets=HTTP_SECRETS)
+    @modal.fastapi_endpoint(method="POST", label="lamp-design-submit")
+    def http_submit(request: dict, authorization: str = "", x_api_key: str = "") -> dict:
+        """Submit a design run. Returns a call id immediately; does not block.
+
+        Non-blocking on purpose: a full sweep is ~90 GPU-seconds, which is
+        longer than most HTTP clients and proxies will wait, and far longer
+        than Cloud Run's per-request budget allows a caller to hold.
+        """
+        from fastapi import HTTPException
+        from fastapi.responses import JSONResponse  # noqa: F401  (documented shape)
+
+        presented = (
+            authorization[7:].strip()
+            if authorization.lower().startswith("bearer ")
+            else (x_api_key or None)
+        )
+        if not _authorized(presented):
+            # 401 with no detail: a precise message here is a probing oracle.
+            raise HTTPException(status_code=401, detail="unauthorized")
+
+        try:
+            # Validate before spawning, so a bad request costs no GPU time and
+            # the caller gets the reason rather than a failed job id.
+            _validate_request(request)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+        call = design_single_container.spawn(request)
+        return {
+            "schema": "lamp-design/http-submit@1",
+            "call_id": call.object_id,
+            "run_id": request.get("run_id"),
+        }
+
+    @app.function(timeout=120, secrets=HTTP_SECRETS)
+    @modal.fastapi_endpoint(method="GET", label="lamp-design-status")
+    def http_status(
+        call_id: str = "", authorization: str = "", x_api_key: str = ""
+    ) -> dict:
+        """Poll a submitted run.
+
+        ``state`` is one of queued / running / succeeded / failed, matching the
+        vocabulary deploy/streamlit/_backend.py already polls on, so the
+        Streamlit client speaks to this endpoint and to the Modal SDK path with
+        the same code.
+        """
+        from fastapi import HTTPException
+
+        presented = (
+            authorization[7:].strip()
+            if authorization.lower().startswith("bearer ")
+            else (x_api_key or None)
+        )
+        if not _authorized(presented):
+            raise HTTPException(status_code=401, detail="unauthorized")
+        if not call_id:
+            raise HTTPException(status_code=400, detail="call_id is required")
+
+        handle = modal.FunctionCall.from_id(call_id)
+        try:
+            # timeout=0 polls without waiting.
+            envelope = handle.get(timeout=0)
+        except TimeoutError:
+            return {"schema": "lamp-design/http-status@1", "state": "running"}
+        except BudgetExceeded as exc:
+            # 429, not 500: the request was fine, the budget is spent. This is
+            # why BudgetExceeded is deliberately not a ValueError.
+            raise HTTPException(status_code=429, detail=str(exc)) from exc
+        except Exception as exc:  # noqa: BLE001 -- surface the failure as data
+            return {
+                "schema": "lamp-design/http-status@1",
+                "state": "failed",
+                "error": f"{type(exc).__name__}: {exc}",
+            }
+        return {
+            "schema": "lamp-design/http-status@1",
+            "state": "succeeded",
+            "envelope": envelope,
+        }

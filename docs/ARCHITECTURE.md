@@ -286,6 +286,39 @@ Numerical agreement across all of the above:
   noise from different FFT implementations, on predictions spanning 0–60 min.
   The GPU path is not an approximation.
 
+### CPU vs GPU on the shipped demo panel, and what it means for Cloud Run
+
+Measured 2026-11-01 on `examples/H5N1_HA_demo.fasta` (10 × ~1.7 kb H5N1 HA,
+1,751 nt consensus), stride 1, 7,583 candidates, 150,228 predictions, same box:
+
+| stage | CPU (8 cores) | GPU (1 × L4) | speedup |
+|---|---|---|---|
+| generation | 0.22 s | 0.21 s | — |
+| thermo | 10.62 s | 10.54 s | — |
+| **inference** | **915.64 s** | **64.02 s** | **14.3×** |
+| report | 0.38 s | 0.36 s | — |
+| **total** | **928.5 s (15.5 min)** | **77.1 s** | **12.0×** |
+| peak RSS | **4.14 GB** | — | |
+
+Identical results: the same 20 sets in the same order, max |ΔTp| **5.8 × 10⁻⁴
+min**. Thermo does not move because it is CPU work on both paths; inference is
+the entire difference, and on CPU it is **98.6%** of the run.
+
+**This does not fit PrimerCast's Cloud Run configuration.** That service is
+4 CPU, 4 GiB, 600 s per-request timeout (`terraform/variables.tf`), sized for
+its own ~10 s runs. Against it:
+
+- 928 s on 8 cores is roughly **31 min on 4 cores** — **3.1× over the 600 s
+  timeout**.
+- Peak RSS 4.14 GB against a 4 GiB (4.29 GB) limit is **96% of the cap**, so
+  a slightly larger panel OOMs.
+
+So a synchronous CPU deployment at stride 1 fails on both axes at once. The
+two shapes that work are in [HANDOFF.md](HANDOFF.md): the portal as a thin
+client polling Modal (each request is milliseconds), or local compute at a
+coarser stride sized to the timeout. This is the concrete reason the Modal
+path is not a luxury.
+
 ### Geometry sampling
 
 At every anchor the generator lays down the **canonical** layout plus four

@@ -417,3 +417,109 @@ def test_pricing_a_corrupt_entry_does_not_raise(app):
         "total_gpu_seconds": 0.0,
     }
     assert app._budget_usd_last_day() == 0.0
+
+
+# ---------------------------------------------------------------------------
+# HTTP front door auth
+#
+# This is the control that stands between the open internet and a GPU, so it
+# is tested directly. The endpoint itself is opt-in (LAMP_DESIGN_HTTP=1) and
+# not created on a normal deploy; `_authorized` is checkable regardless.
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def auth(monkeypatch):
+    module = _load_app()
+    monkeypatch.delenv("LAMP_DESIGN_API_KEYS", raising=False)
+    return module
+
+
+def test_no_configured_keys_denies_everything(auth, monkeypatch):
+    """Fails CLOSED -- the opposite of the budget ledger, on purpose."""
+    monkeypatch.setenv("LAMP_DESIGN_API_KEYS", "")
+    assert auth._authorized("anything") is False
+    assert auth._authorized("") is False
+    assert auth._authorized(None) is False
+
+
+def test_a_missing_key_variable_denies_everything(auth):
+    """Not merely empty -- absent. A typo'd secret must not open the door."""
+    assert auth._authorized("anything") is False
+
+
+def test_the_configured_key_is_accepted(auth, monkeypatch):
+    monkeypatch.setenv("LAMP_DESIGN_API_KEYS", "sekrit")
+    assert auth._authorized("sekrit") is True
+
+
+def test_a_wrong_key_is_rejected(auth, monkeypatch):
+    monkeypatch.setenv("LAMP_DESIGN_API_KEYS", "sekrit")
+    assert auth._authorized("sekrit2") is False
+    assert auth._authorized("sekri") is False
+    assert auth._authorized("SEKRIT") is False
+    assert auth._authorized(None) is False
+
+
+def test_several_keys_are_accepted_so_rotation_is_additive(auth, monkeypatch):
+    """Rotation: add the new key, move callers, drop the old one."""
+    monkeypatch.setenv("LAMP_DESIGN_API_KEYS", "old-key, new-key ")
+    assert auth._authorized("old-key") is True
+    assert auth._authorized("new-key") is True
+    assert auth._authorized("other") is False
+
+
+def test_blank_entries_in_the_list_are_not_usable_keys(auth, monkeypatch):
+    """A trailing comma must not make the empty string a valid credential."""
+    monkeypatch.setenv("LAMP_DESIGN_API_KEYS", "real-key,, ,")
+    assert auth._authorized("real-key") is True
+    assert auth._authorized("") is False
+    assert auth._authorized(" ") is False
+
+
+def test_the_key_check_uses_a_constant_time_comparison(auth):
+    """A plain == here leaks key material through timing."""
+    body = _function_body(APP_PATH.read_text(), "def _authorized")
+    assert "compare_digest" in body, "key comparison must be constant-time"
+    assert "==" not in body.replace("!=", ""), "found a direct comparison"
+
+
+def test_the_bearer_header_is_parsed_both_documented_ways(auth):
+    assert auth._bearer({"authorization": "Bearer abc"}) == "abc"
+    assert auth._bearer({"Authorization": "bearer abc"}) == "abc"
+    assert auth._bearer({"x-api-key": "abc"}) == "abc"
+    assert auth._bearer({"X-API-Key": "abc"}) == "abc"
+    assert auth._bearer({}) is None
+
+
+def test_the_endpoint_is_opt_in(auth):
+    """An unauthenticated public URL for a GPU function is the costly mistake."""
+    assert auth.HTTP_ENABLED is False, "HTTP must be off unless asked for"
+    source = APP_PATH.read_text()
+    assert "if HTTP_ENABLED:" in source, "endpoints must be behind the flag"
+    # The decorators must be inside that guard, not merely the function bodies.
+    guard = source.index("if HTTP_ENABLED:")
+    assert source.rindex("modal.fastapi_endpoint") > guard
+    # Every decorator, not just the last one.
+    assert all(
+        source.index(line) > guard
+        for line in source.splitlines()
+        if line.strip().startswith("@modal.fastapi_endpoint")
+    )
+
+
+def test_the_submit_endpoint_validates_before_spawning(auth):
+    """A bad request must cost no GPU time and must say why."""
+    body = _function_body(APP_PATH.read_text(), "def http_submit")
+    assert body.index("_validate_request") < body.index(".spawn("), (
+        "validation must precede spawn"
+    )
+    assert "400" in body, "a malformed request should be a 400"
+    assert "401" in body, "an unauthorized request should be a 401"
+
+
+def test_a_spent_budget_is_a_429_not_a_500(auth):
+    """The request was fine; the budget is spent. Different failure, different code."""
+    body = _function_body(APP_PATH.read_text(), "def http_status")
+    assert "BudgetExceeded" in body
+    assert "429" in body

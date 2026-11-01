@@ -52,10 +52,23 @@ LAMP_DESIGN_WEIGHTS=/path/to/tp60_A_v0t9 \
 genomes from NCBI, 1,715–1,751 nt, taken from PrimerCast's own `target_seqs/`.
 They are ragged, so the run exercises the MAFFT alignment path.
 
-For the UI:
+In Docker (`--user` matters — the image runs as a non-root user, so without it
+every write to `/data` fails with "Permission denied" *after* the pipeline has
+done all its work):
 
 ```bash
 docker build -t lamp-design:cpu .
+
+docker run --rm --user "$(id -u):$(id -g)" \
+  -v /path/to/tp60_A_v0t9:/weights:ro \
+  -v "$PWD":/data -v "$PWD/examples":/examples:ro \
+  lamp-design:cpu \
+  lamp-design design --in /examples/H5N1_HA_demo.fasta --stride 60 --out /data/demo
+```
+
+For the UI:
+
+```bash
 docker build -t lamp-design:portal -f Dockerfile.portal .
 docker run --rm -p 8080:8080 -v /path/to/tp60_A_v0t9:/weights:ro lamp-design:portal
 ```
@@ -68,10 +81,22 @@ Then open <http://localhost:8080> and pick **Demo panel** on the Target step.
 per-request timeout** (`terraform/variables.tf`). Its own runs take ~10 s, so
 it never comes close.
 
-This workload is not that shape. A stride-1 design is ~90 s of *GPU* work on
-the demo panel, and inference is ~89% of it. On CPU it is far longer — see
-`docs/ARCHITECTURE.md` for the measured figure. Deploying the portal image
-synchronously on Cloud Run at stride 1 will hit that timeout.
+This workload is not that shape. Measured on the shipped demo panel at
+stride 1, same box:
+
+| | CPU (8 cores) | GPU (1 × L4) |
+|---|---|---|
+| total | **928 s (15.5 min)** | **77 s** |
+| of which inference | 916 s (98.6%) | 64 s |
+| peak RSS | **4.14 GB** | — |
+
+Same 20 sets in the same order either way, max |ΔTp| 5.8 × 10⁻⁴ min — the CPU
+path is not an approximation, just slow.
+
+Against 4 CPU / 4 GiB / 600 s, it **fails on both axes at once**: 928 s on 8
+cores is ~31 min on 4, which is 3.1× over the timeout, and 4.14 GB peak is 96%
+of the 4 GiB cap, so a slightly larger panel OOMs. Do not deploy the portal
+image synchronously at stride 1.
 
 Three shapes work. Pick by what you control.
 
@@ -108,12 +133,28 @@ volume-upload step and its symlink trap are the only fiddly parts.
 
 ## Do not change these
 
-**`RNAduplex` is pinned to 2.4.17.** The installed version decides the binding
-ΔG every prediction is conditioned on, and a wrong one **does not crash** — it
-quietly returns different numbers, so you get different designs with no error.
-Both images pin it and both assert it at build time. This is not theoretical:
-the CLI image was once unpinned and resolved 2.7.2 while Modal pinned 2.4.17,
-which would have made the two paths disagree.
+**Don't change ViennaRNA without re-running the ΔG check.** The installed
+version decides the binding ΔG every prediction is conditioned on, and a wrong
+one **does not crash** — it quietly returns different numbers, so you get
+different designs with no error anywhere.
+
+The two images guard this differently, for a reason worth knowing:
+
+- The **Modal image** pins the `RNAduplex` binary to **2.4.17** via apt and
+  asserts the version at build time.
+- The **CLI image** cannot — bioconda has no 2.4.17 build for Python 3.10 — so
+  it asserts the property the pin stands for: `scripts/check_dg_reference.py`
+  compares six fixed pairs against values measured on 2.4.17 and fails the
+  build on any drift.
+
+Measured outcome: the CLI image resolves ViennaRNA **2.7.2**, and it passes the
+ΔG check to within 1e-4 kcal/mol. **So the two paths agree**, and that is
+verified rather than assumed — which is why the ΔG check is the better guard of
+the two. A version string would also pass on a 2.4.17 that had been patched,
+rebuilt against different parameters or miscompiled.
+
+If you change the ViennaRNA version, `python scripts/check_dg_reference.py` is
+the one thing you must run.
 
 **`primer3-py` is held below 2.1.** 2.1.0 changed the santalucia salt
 correction and shifts every Tm by +2.17 °C away from the values the model was

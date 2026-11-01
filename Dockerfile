@@ -19,17 +19,28 @@
 # Build:
 #   docker build -t lamp-design:cpu .
 #
-# Run (note the two mounts: read-only weights, read-write data):
-#   docker run --rm \
-#     -v /host/path/LAMP_experiment_20260905_021750_tp60_A_v0t9:/weights:ro \
+# Run. Note the two mounts (read-only weights, read-write data) and `--user`:
+# the image runs as a non-root user, so without it every write to /data fails
+# with "Permission denied" *after* the pipeline has done all its work. Mapping
+# to the caller's uid also means the outputs are owned by them, not by root.
+#
+#   docker run --rm --user "$(id -u):$(id -g)" \
+#     -v /host/path/tp60_A_v0t9:/weights:ro \
 #     -v "$PWD":/data \
 #     lamp-design:cpu \
 #     lamp-design prepare --in /data/targets.fa --out /data/panel.json
 #
-#   docker run --rm \
-#     -v /host/path/checkpoints:/weights:ro -v "$PWD":/data \
+#   docker run --rm --user "$(id -u):$(id -g)" \
+#     -v /host/path/tp60_A_v0t9:/weights:ro -v "$PWD":/data \
 #     lamp-design:cpu \
-#     lamp-design design --in /data/panel.json --out /data/sets.tsv
+#     lamp-design design --in /data/panel.json --out /data/sets
+#
+# Verified 2026-11-01: a stride-60 design on examples/H5N1_HA_demo.fasta runs
+# to completion in-container in 15.4 s and writes all four outputs.
+#
+# The weights mount must be a *dereferenced* copy -- see docs/HANDOFF.md. In a
+# dev checkout the five .pt files are symlinks into a training directory, and
+# a bind mount of those gives the container dangling links.
 #
 # To put the checkpoints somewhere else, override the variable and the mount:
 #   -v /host/ckpts:/mnt/ckpts:ro -e LAMP_DESIGN_WEIGHTS=/mnt/ckpts
