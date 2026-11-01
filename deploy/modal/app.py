@@ -1514,6 +1514,24 @@ def doctor_gpu() -> dict:
 # ---------------------------------------------------------------------------
 
 
+#: Timing keys that are NOT wall-clock stages, so they must never be summed
+#: into ``total``. ``gpu_seconds`` is the sum across every shard -- 10 shards
+#: of 7s each is 70 "seconds" of a run that took 33 -- so including it made
+#: `design_fanout` report total=96.1 for a run measured at 33.1s wall. It did
+#: not show up in `design_single_container` only because there `total` happens
+#: to be computed before `gpu_seconds` is inserted, which is luck, not design.
+_NON_STAGE_TIMINGS = frozenset({"gpu_seconds", "total"})
+
+
+def _stage_total(timing: dict) -> float:
+    """Wall-clock sum of the pipeline stages, excluding accounting entries."""
+    return sum(
+        float(v)
+        for k, v in timing.items()
+        if k not in _NON_STAGE_TIMINGS and isinstance(v, (int, float))
+    )
+
+
 @app.function(
     cpu=2.0,
     timeout=3600,
@@ -1652,7 +1670,7 @@ def design_fanout(request: dict) -> dict:
     result.params["shards"] = len(shards)
     result.params["fanout"] = fanout_allowed
     timing["rank"] = time.time() - started
-    timing["total"] = sum(timing.values())
+    timing["total"] = _stage_total(timing)
     envelope = _finish(result, req, run_dir, timing)
     results_volume.commit()
     return envelope
@@ -1771,7 +1789,7 @@ def design_single_container(request: dict) -> dict:
         timings=dict(timing),
     )
     timing["infer"] = time.time() - started
-    timing["total"] = sum(timing.values())
+    timing["total"] = _stage_total(timing)
 
     # The whole container lifetime counts, including prepare and thermo: the
     # GPU was allocated and billed throughout, idle or not. Recording the

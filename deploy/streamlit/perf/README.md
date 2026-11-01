@@ -153,14 +153,43 @@ For scale, our portal image is 3.4 GB and takes ~2s to serve its first request
 once the image is already local — on Cloud Run, add the image pull and a cold
 Python start on top of that.
 
-**Fix: `min_instances = 1`.** One always-warm instance. It is the single
-highest-impact change available and it is one line of Terraform. It costs
-idle CPU/memory continuously, which is exactly the tradeoff their comment was
-making — but for a demo people are being *invited* to try, a slow first
-impression is the more expensive side of it.
+### What a cold start actually is
 
-A cheaper partial measure: `startup_cpu_boost = true` and `cpu_idle = false`
-are already set in PrimerCast's `cloud_run.tf`, so that lever is pulled.
+Not a session or a connection — **the whole server does not exist yet.** Cloud
+Run runs nothing when idle. The first request after idle has to, in order:
+
+1. allocate a machine and mount the container image (GBs, and the ML stack is
+   most of it),
+2. start a fresh Python interpreter,
+3. `import torch` — **1.76s measured**, before any application code,
+4. import Streamlit and the app's own modules — ~1.2s measured,
+5. boot the Streamlit server and run the script once,
+6. *then* send the first byte of HTML.
+
+Only after all six does the browser even learn which assets to fetch. So this
+is not "the page is slow to load" as distinct from the server — the page is
+slow to load *because* the server is still being built while the browser
+waits. Every later visit within the idle window skips all six.
+
+### Fix: `min_instances = 1`
+
+One always-warm instance, one line of Terraform. Highest-impact change
+available. The cost is a container billed continuously rather than per
+request, which is exactly the tradeoff PrimerCast's `min_instances = 0`
+comment was making — reasonable for a tool nobody is being pointed at, wrong
+for a demo people are being *invited* to try. Check current Cloud Run pricing
+for the configured 4 vCPU / 4 GiB before committing; it is not free.
+
+### Cheaper alternative: keep it warm with a ping
+
+A Cloud Scheduler job hitting `/_stcore/health` every 5 minutes keeps the
+instance alive at the cost of a trivial request, rather than paying for a
+reserved instance. Less deterministic than `min_instances` — a burst can
+still cold-start a *second* instance — but it removes the common case for
+roughly nothing, and `/_stcore/health` is already there for it.
+
+`startup_cpu_boost = true` and `cpu_idle = false` are already set in
+PrimerCast's `cloud_run.tf`, so that lever is pulled.
 
 ---
 

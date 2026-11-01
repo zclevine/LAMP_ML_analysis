@@ -523,3 +523,37 @@ def test_a_spent_budget_is_a_429_not_a_500(auth):
     body = _function_body(APP_PATH.read_text(), "def http_status")
     assert "BudgetExceeded" in body
     assert "429" in body
+
+
+# ---------------------------------------------------------------------------
+# Timing arithmetic
+#
+# `total` is what a user reads to know how long a run took. design_fanout
+# reported 96.1s for a run measured at 33.1s wall, because gpu_seconds -- the
+# sum across ten shards -- was already in the dict being summed.
+# ---------------------------------------------------------------------------
+
+
+def test_stage_total_excludes_gpu_seconds(auth):
+    """The specific bug: 10 shards x 7s must not become 70s of "total"."""
+    timing = {"prepare": 2.0, "shards": 14.0, "rank": 1.0, "gpu_seconds": 77.5}
+    assert auth._stage_total(timing) == pytest.approx(17.0)
+
+
+def test_stage_total_ignores_a_previous_total(auth):
+    """Idempotent: recomputing must not compound."""
+    timing = {"prepare": 2.0, "infer": 8.0, "total": 10.0}
+    assert auth._stage_total(timing) == pytest.approx(10.0)
+
+
+def test_stage_total_skips_non_numeric_entries(auth):
+    """A diagnostic string in the timing dict must not raise."""
+    timing = {"prepare": 2.0, "note": "retried once", "infer": 3.0}
+    assert auth._stage_total(timing) == pytest.approx(5.0)
+
+
+def test_both_gpu_paths_compute_total_the_same_way(auth):
+    """design_single_container was correct only by insertion order."""
+    source = APP_PATH.read_text()
+    assert source.count("_stage_total(timing)") == 2
+    assert 'timing["total"] = sum(timing.values())' not in source
