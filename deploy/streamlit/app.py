@@ -534,14 +534,33 @@ def _estimate(params: dict) -> dict[str, float | int] | None:
     }
 
 
+def _round_candidates(n: int) -> str:
+    """A pre-run candidate count, rounded, because precision here misleads.
+
+    The exact figure is an *upper bound* that two separate effects then reduce,
+    and quoting it to the unit invites the reader to ask why it is not
+    ``length x geometries``:
+
+      * a set spanning S bases cannot start in the last S-1 positions, so five
+        geometries over 5 kb give ~24,100 slots rather than 25,000; then
+      * the GC screen drops whatever fails 20-80% on any of the eight primers,
+        a further ~5% on an even-GC panel and much more on a skewed one.
+
+    So the honest pre-run number is approximate by nature. The *exact* count
+    is reported after generation, in the funnel, where it is a measurement
+    rather than an estimate.
+    """
+    if n < 1000:
+        return f"{n:,}"
+    step = 1000 if n < 100_000 else 10_000
+    return f"~{round(n / step) * step:,}"
+
+
 def describe_scope(estimate: dict) -> str:
     """One sentence naming the size of the search, for the run page.
 
     Says what is actually being searched, in the user's own terms, so the run
     is legible while it is happening rather than only in the funnel afterwards.
-    Every number is the real one the engine will use -- candidates is
-    ``count_candidate_slots``' arithmetic, before the GC screen trims it, so
-    this is an upper bound and the funnel in the result will be slightly lower.
 
     Deduplication does not belong in this sentence: it skips *recomputing*
     inputs that are byte-identical, so every candidate named here really is
@@ -551,7 +570,7 @@ def describe_scope(estimate: dict) -> str:
     n_mixes = int(estimate["n_mixes"])
     targets = int(estimate["n_targets"])
     parts = [
-        f"**{int(estimate['candidates']):,}** candidate primer sets",
+        f"**{_round_candidates(int(estimate['candidates']))}** candidate primer sets",
         f"**{targets}** target{'s' if targets != 1 else ''}",
     ]
     if n_mixes > 1:
@@ -561,7 +580,7 @@ def describe_scope(estimate: dict) -> str:
     )
     return (
         "Checking " + ", ".join(parts[:-1]) + f" and {parts[-1]}"
-        f" — **{int(estimate['predictions']):,}** model evaluations."
+        f" — **{_round_candidates(int(estimate['predictions']))}** model evaluations."
     )
 
 

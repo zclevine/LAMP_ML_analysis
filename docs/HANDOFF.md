@@ -86,17 +86,23 @@ stride 1, same box:
 
 | | CPU (8 cores) | GPU (1 × L4) |
 |---|---|---|
-| total | **928 s (15.5 min)** | **77 s** |
-| of which inference | 916 s (98.6%) | 64 s |
-| peak RSS | **4.14 GB** | — |
+| total | **241 s** | **37 s** |
+| peak RSS | **3.43 GB** | — |
 
-Same 20 sets in the same order either way, max |ΔTp| 5.8 × 10⁻⁴ min — the CPU
-path is not an approximation, just slow.
+Same 20 sets in the same order either way — the CPU path is not an
+approximation, just slower.
 
-Against 4 CPU / 4 GiB / 600 s, it **fails on both axes at once**: 928 s on 8
-cores is ~31 min on 4, which is 3.1× over the timeout, and 4.14 GB peak is 96%
-of the 4 GiB cap, so a slightly larger panel OOMs. Do not deploy the portal
-image synchronously at stride 1.
+**These numbers improved by 3.9× on 2026-11-01** when input deduplication
+landed (identical model inputs are now computed once; see
+`docs/ARCHITECTURE.md`). Before it, CPU was 928 s and 4.14 GB, which failed
+PrimerCast's limits on both axes at once.
+
+It now **plausibly fits, with thin margin**: 241 s on 8 cores extrapolates to
+roughly 480 s on 4 — inside the 600 s timeout, but only 20% clear of it — and
+3.43 GB is 80% of the 4 GiB cap. Treat as: possible, not comfortable. A larger
+panel, more targets, or a slower vCPU puts it back over. **Measure with your
+own panel before committing to a synchronous CPU deployment**, and keep
+stride as the lever if it is close.
 
 Three shapes work. Pick by what you control.
 

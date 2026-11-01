@@ -304,20 +304,30 @@ Identical results: the same 20 sets in the same order, max |ΔTp| **5.8 × 10⁻
 min**. Thermo does not move because it is CPU work on both paths; inference is
 the entire difference, and on CPU it is **98.6%** of the run.
 
-**This does not fit PrimerCast's Cloud Run configuration.** That service is
-4 CPU, 4 GiB, 600 s per-request timeout (`terraform/variables.tf`), sized for
-its own ~10 s runs. Against it:
+**Superseded by deduplication.** The table above predates input dedup. Re-run
+on 2026-11-01 with it:
 
-- 928 s on 8 cores is roughly **31 min on 4 cores** — **3.1× over the 600 s
-  timeout**.
-- Peak RSS 4.14 GB against a 4 GiB (4.29 GB) limit is **96% of the cap**, so
-  a slightly larger panel OOMs.
+| | CPU (8 cores) | GPU (1 × L4) |
+|---|---|---|
+| total | **240.6 s** (was 928.5) | **37.4 s** (was 77.1) |
+| speedup from dedup | **3.86×** | 2.06× |
+| peak RSS | **3.43 GB** (was 4.14) | — |
 
-So a synchronous CPU deployment at stride 1 fails on both axes at once. The
-two shapes that work are in [HANDOFF.md](HANDOFF.md): the portal as a thin
-client polling Modal (each request is milliseconds), or local compute at a
-coarser stride sized to the timeout. This is the concrete reason the Modal
-path is not a luxury.
+CPU gains more than GPU because inference was 98.6% of a CPU run, so removing
+65% of it removes most of the whole thing.
+
+**What that does to the Cloud Run question.** PrimerCast's service is 4 CPU,
+4 GiB, 600 s per-request timeout (`terraform/variables.tf`), sized for its own
+~10 s runs. Before dedup a stride-1 CPU run failed both limits at once: 31 min
+against a 600 s timeout, and 96% of the memory cap. After it, 240.6 s on 8
+cores extrapolates to **~480 s on 4** — inside the timeout with ~20% margin —
+and 3.43 GB is 80% of the cap.
+
+So a synchronous CPU deployment is no longer categorically out, but the margin
+is thin and the 4-core figure is an extrapolation from an 8-core measurement,
+not a measurement. A larger panel, more targets or a slower vCPU puts it back
+over. Modal remains the right default; CPU is now a viable fallback rather
+than an impossible one. Both shapes are written up in [HANDOFF.md](HANDOFF.md).
 
 ### Geometry sampling
 

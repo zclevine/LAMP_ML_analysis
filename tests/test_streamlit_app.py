@@ -798,10 +798,13 @@ def test_the_scope_sentence_names_candidates_targets_and_concentrations():
             "seconds": 210.0,
         }
     )
-    assert "24,033" in scope and "candidate primer sets" in scope
+    # Rounded on purpose: the pre-run figure is an upper bound that edge
+    # effects and the GC screen then reduce, so quoting it to the unit invites
+    # "why isn't it length x geometries?". The exact count is in the funnel.
+    assert "~24,000" in scope and "candidate primer sets" in scope
     assert "10" in scope and "targets" in scope
     assert "2" in scope and "concentrations" in scope
-    assert "480,660" in scope
+    assert "~480,000" in scope
     # One master mix must not be announced -- it would read as a parameter the
     # user chose rather than the default it is.
     assert "master mix" not in scope
@@ -838,3 +841,14 @@ def test_the_scope_sentence_singularises():
     assert "1 target " in scope or "1** target " in scope
     assert "targets" not in scope
     assert "concentrations" not in scope
+
+
+def test_the_pre_run_candidate_count_is_rounded():
+    """Exact-looking estimates invite a question the number cannot answer."""
+    round_candidates = _portal()._round_candidates
+    assert round_candidates(24033) == "~24,000"
+    assert round_candidates(24145) == "~24,000"
+    assert round_candidates(480660) == "~480,000"
+    # Small counts are exact: there is nothing misleading about "5".
+    assert round_candidates(5) == "5"
+    assert round_candidates(999) == "999"
