@@ -243,13 +243,22 @@ Three things follow, and two of them are counterintuitive:
 1. **The GPU is worth ~15×**, which is what makes it the primary path rather
    than an optimization.
 2. **Bigger GPU batches are slightly worse**, and the L4 sat at **18–29%
-   utilization** (370 MiB of 23 GB, 46 W of 72 W) the whole time. The GPU is not
-   the constraint — `bridge.encode_pairs` is. It encodes one `(L, 19)` row at a
-   time in a Python loop at **5,454 rows/s**, single-threaded, and
-   `predict_tp` encodes a whole chunk *before* handing it to the model, so the
-   GPU idles through it. That is **4% of a CPU run** but roughly **42% of the
-   GPU inference stage**, because going to GPU made inference ~15× faster and
-   left encoding untouched.
+   utilization** (370 MiB of 23 GB, 46 W of 72 W) the whole time. Part of the
+   reason is `bridge.encode_pairs`: it encodes one `(L, 19)` row at a time in a
+   Python loop at **5,454 rows/s**, single-threaded, and `predict_tp` encodes a
+   whole chunk *before* handing it to the model, so the GPU idles through it.
+   That is **4% of a CPU run** but roughly **42% of the GPU inference stage**,
+   because going to GPU made inference ~15× faster and left encoding untouched.
+
+   **Correction (2026-11-01).** This section used to conclude from that "the
+   GPU is not the constraint", and `deploy/modal/app.py` used to conclude from
+   it that a bigger GPU "buys almost nothing". A head-to-head measurement says
+   otherwise: on the same input an L40S runs the inference stage **2.71×**
+   faster than an L4 (see [The full sweep](#the-full-sweep-measured-end-to-end)).
+   Low utilization did not mean idle capacity going to waste — the stage is
+   latency-bound on a long sequence of small kernels, and the L40S retires each
+   one faster. Utilization percentage was simply the wrong instrument for the
+   question "would a faster GPU help"; a stopwatch was the right one.
 
    The fix is CPU work, and *pipelining* beats parallelizing: overlap the
    encoding of chunk N+1 with the model on chunk N and most of that 42%
@@ -291,6 +300,39 @@ The design notes' maximum-size run — 5 kb consensus, 10 targets, **stride 1**,
 
 So a worst-case design run is **under eight minutes on a single commodity
 GPU**, and 3.4 GB of the L4's 23 GB. The same job on CPU would be ~76 minutes.
+
+#### The same sweep on Modal, and on a bigger GPU
+
+Re-measured 2026-11-01 **at the shipped 1×2 condition default** rather than 4
+conditions, on a seeded 10 × 5 kb panel (22,773 candidate sets), both runs via
+`design_single_container` on Modal:
+
+| stage | L4 | L40S | speedup |
+|---|---|---|---|
+| prepare | 0.55 s | 0.25 s | 2.2× |
+| thermo | 11.70 s | 6.83 s | 1.7× |
+| inference | 207.80 s | 76.74 s | **2.71×** |
+| **total GPU-seconds** | **220.34** | **84.07** | **2.62×** |
+| wall clock (incl. cold start) | 259 s | **95 s** | 2.7× |
+| cost at modal.com/pricing | $0.0489 | **$0.0456** | — |
+
+**The L40S is 2.6× faster and marginally cheaper per run**, because its 2.44×
+rate ($0.000542/s vs $0.000222/s) is less than its speedup. It is now the
+default in `deploy/modal/app.py`. Results are bit-identical between the two:
+the same 20 sets in the same order, max |diff| **0.0** across every reported
+score — so this is a pure latency win, not a precision tradeoff.
+
+Two other things fell out of that run:
+
+- **Halving the conditions halved inference**, as predicted: 410.35 s at 4
+  conditions → 207.80 s at 2, on comparable candidate counts. Thermo is
+  condition-independent (it is per primer-target window) and did not move for
+  that reason.
+- **Thermo on Modal was 4× faster than the local measurement** (11.70 s vs
+  48.60 s) on a comparable panel. `design_single_container` spreads thermo over
+  a multiprocessing pool and the local CLI path may not; this is an unexplained
+  discrepancy, flagged rather than resolved. It does not affect ranking, and
+  thermo is now 5% of a run rather than 10.5%.
 
 Two consequences for deployment: a synchronous web request cannot hold this, so
 the portal needs submit-and-poll regardless of backend; and one GPU container
@@ -368,10 +410,21 @@ caps at about 1.1× no matter how many containers it gets — thermo is 10.5% of
 a run.
 
 Free-plan limits (confirmed on modal.com/pricing, 2026-10-30): **10 concurrent
-GPUs, 100 containers, $30/month of credit**. At L4 pricing of $0.000222/s, the
-7.7-minute sweep is ~410 GPU-seconds ≈ **$0.09 per run**, so the free credit is
-on the order of 300 full-sweep runs per month. Ten-way fan-out should bring
-that sweep to roughly 1–1.5 min wall clock at the same price.
+GPUs, 100 containers, $30/month of credit**. A full stride-1 sweep measures
+**84 GPU-seconds ≈ $0.046** on one L40S, so the free credit is on the order of
+650 full-sweep runs per month.
+
+**Fan-out is the wrong lever for a single run, and the measurement says so.**
+The paragraph above is still true about billing, but it omits the constant: a
+whole sweep is now 84 GPU-seconds, so splitting it 10 ways leaves ~8 seconds of
+work per shard against a cold start plus five checkpoint loads — measured once
+at 26.6 GPU-s across 5 shards to do 7.3 GPU-s of work. One container at ~95 s
+wall clock is both faster and cheaper than fanning that out.
+
+`design_fanout` keeps its place for the two cases where it does earn its keep:
+**throughput** when many users submit at once (each run gets its own container
+regardless), and inputs well beyond the design notes' maximum. For one design
+on the maximum input, use `design_single_container`.
 
 ## Layout
 

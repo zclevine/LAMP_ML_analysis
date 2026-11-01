@@ -4,8 +4,10 @@ GPU/CPU harness for the LAMP design engine: [`app.py`](app.py).
 
 > **Status: verified end to end on 2026-11-01.** The image builds, `doctor`
 > and `doctor_gpu` pass, and `design_single_container`, `design_fanout` and the
-> Streamlit backend seam have all produced real results on an L4 — agreeing
-> with a local run to within 2.7e-06 minutes. See
+> Streamlit backend seam have all produced real results — agreeing with a local
+> run to within 2.7e-06 minutes. A **full-scale** sweep (22,773 candidate sets,
+> stride 1) has since run on both an L4 and an L40S; the L40S is 2.6× faster at
+> slightly lower cost and is now the default. See
 > [What has been verified](#what-has-been-verified) for exactly what was
 > checked and what still has not been.
 
@@ -39,9 +41,40 @@ rather than left deployed and unreachable.
 What fans out now is the **candidates**. Each set's predicted Tp is independent
 of every other's — ranking is the only step that sees them together, and it
 happens in the orchestrator after the merge — so 99.5% of the run is
-embarrassingly parallel. Modal bills per GPU-second, so 10 containers cost what
-1 does and finish in ~1/10 the wall clock: **~7.7 min → ~1 min**, ~$0.09/run
-either way. See [`../README.md`](../README.md) for which path to use when.
+embarrassingly parallel. See [`../README.md`](../README.md) for which path to
+use when.
+
+### Fan-out is probably not the lever
+
+This file used to finish that paragraph with "10 containers cost what 1 does
+and finish in ~1/10 the wall clock: ~7.7 min → ~1 min, ~$0.09/run either way."
+The billing half is right; the conclusion was wrong, because it reasoned about
+a ratio and ignored the constant.
+
+Measured 2026-11-01 on a seeded 10 × 5 kb panel at stride 1 (22,773 candidate
+sets, the 1×2 condition default), both via `design_single_container`:
+
+| | L4 | L40S |
+|---|---|---|
+| prepare | 0.55 s | 0.25 s |
+| thermo | 11.70 s | 6.83 s |
+| inference | 207.80 s | 76.74 s |
+| **GPU-seconds** | **220.34** | **84.07** |
+| wall clock | 259 s | **95 s** |
+| cost | $0.0489 | **$0.0456** |
+
+Same 20 sets, same order, max |diff| **0.0** on every score — so the L40S is a
+free 2.6×, and it is now the default.
+
+The consequence for fan-out: a whole sweep is **84 GPU-seconds**. Split 12 ways
+that is ~7 s of work per shard, against a container start plus five checkpoint
+loads — measured at 26.6 GPU-s across 5 shards to do 7.3 GPU-s of work. There
+is nothing left to parallelise profitably. **One container, ~1.6 min, is the
+answer for a single design.**
+
+`design_fanout` stays for the cases where it does pay: **concurrent users**
+(throughput, not latency — each run gets its own container anyway) and inputs
+well past the design notes' maximum.
 
 ---
 
@@ -242,9 +275,9 @@ editing code. Set them in the shell you run `modal deploy` from.
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `LAMP_DESIGN_MODAL_GPU` | `L4` | GPU type. L4 is the default because every performance number in `docs/ARCHITECTURE.md` was measured on one, so it is the only figure that is not an extrapolation. T4 is 26% cheaper and the GPU only reached 18–29% utilisation, so T4 may be nearly as fast — measure before switching. |
+| `LAMP_DESIGN_MODAL_GPU` | `L40S` | GPU type. **Measured head to head** on the same 22,773-candidate sweep: L40S 84.07 GPU-s / $0.0456, L4 220.34 GPU-s / $0.0489 — 2.6× faster *and* cheaper, with bit-identical results. T4 is the cheapest per second ($0.000164) but was not measured; given the L4→L40S result, assume it is slower *and* dearer per run until someone checks. |
 | `LAMP_DESIGN_INFER_CONTAINERS` | `10` | Fan-out width for `design_shard`, and the free plan's concurrent-GPU limit. |
-| `LAMP_DESIGN_INFER_SHARD_SETS` | `2000` | Candidate sets per shard. **Measured:** on a 104-candidate input, 5 shards cost 26.6 GPU-s against single-container's 7.3 — each shard pays container start, weights load and torch init. Fan-out is a loss until a shard amortises that, which is what this number is for. |
+| `LAMP_DESIGN_INFER_SHARD_SETS` | `2000` | Candidate sets per shard. **Measured:** on a 104-candidate input, 5 shards cost 26.6 GPU-s against single-container's 7.3 — each shard pays container start, weights load and torch init. Now that a *whole* sweep is 84 GPU-s on an L40S, fan-out has no room to pay that back on one run; see [Fan-out is probably not the lever](#fan-out-is-probably-not-the-lever). Also mis-sized: 22,773 / 2,000 = 12 shards against 10 containers, so two run in a second wave while eight GPUs idle. If you do fan out, set this to `ceil(n_sets / n_containers)`. |
 | `LAMP_DESIGN_THERMO_CHUNK` | `256` | Primer sets per chunk in the in-process thermo pool. A guess, not a measurement. |
 | `LAMP_DESIGN_SINGLE_CPUS` | `16` | Cores for the single-container thermo pool. |
 | `LAMP_DESIGN_SINGLE_MEMORY_MB` | `32768` | Memory for the single-container path. |
@@ -306,9 +339,23 @@ than it works is worse than none:
 3. It is advisory, enforced in this file. **Set Modal's own workspace spend
    limit in the dashboard as well**; that one cannot be bypassed by a bug here.
 
-For scale: the free plan's $30 monthly credit is ~37.5 GPU-hours at the L4
-rate, so the *credit* is a tighter constraint than 50 GPU-hours/day could ever
-be. A full stride-1 design run is ~7.7 GPU-minutes (~$0.09).
+For scale: the free plan's $30 monthly credit is ~15.4 GPU-hours at the L40S
+rate (~37.5 at the L4 rate), so the *credit* is a tighter constraint than 50
+GPU-hours/day could ever be. A full stride-1 design run is **84 GPU-seconds
+(~$0.046)**, so the credit is ~650 sweeps per month.
+
+The dollar figures `--mode budget` reports are priced from `GPU_USD_PER_SECOND`
+in `app.py`. `approx_usd_last_day` is exact per run, because each ledger entry
+records the GPU it ran on; `approx_usd_total_at_default_rate` cannot be, because
+the cumulative total is a single GPU-second scalar that outlives pruning. Both
+are advisory — the dashboard is authoritative.
+
+> **Transitional over-count.** The 10 entries recorded before the GPU field
+> existed are priced at the *default's* rate, so on 2026-11-01 the ledger read
+> $0.2021 against an actual $0.1097 (eight L4 runs at $0.0152, one L4 sweep at
+> $0.0489, one L40S sweep at $0.0456). Those entries leave the trailing-day
+> window within 24 hours. A spend control that errs high is the right kind of
+> wrong, so this was left to age out rather than hand-edited in a live `Dict`.
 
 
 Timeouts and retries are set per function in `app.py`: thermo chunks retry
@@ -415,13 +462,17 @@ argument for doing step 4 before trusting anything:
 
 ### Still not verified
 
-1. **A full-scale run.** Everything above used a 4 × 600 nt panel at stride 20
-   (104 candidates). The 7.7-minute / 940,520-prediction figure is from a local
-   L4, not from Modal, and `INFER_SHARD_SETS=2000` has never been exercised at
-   a size where it is the right number.
+1. ~~**A full-scale run.**~~ **Done 2026-11-01**: 22,773 candidate sets at
+   stride 1 on both an L4 and an L40S via `design_single_container`, 20 sets
+   returned, no errors. See [Fan-out is probably not the lever](#fan-out-is-probably-not-the-lever).
+   Still untested at full scale: `design_fanout`, so `INFER_SHARD_SETS=2000`
+   has never been exercised at a size where it is the right number — and the
+   measurement above suggests it never will be the right number for one run.
 2. **Fan-out actually paying off.** Measured on the small input it costs 3.6×
    *more* GPU-seconds than single-container, because each shard pays container
-   start, weights load and torch init. The crossover point is unmeasured.
+   start, weights load and torch init. The crossover point is still unmeasured,
+   and is now believed to be beyond the maximum supported input rather than
+   inside it.
 3. **MAFFT on the alignment path.** It is installed in the image (and absent
    from the dev box), but no run has fed it ragged multi-FASTA input.
 4. **Retry behaviour.** `design_shard` has `retries=1`; no shard has failed.

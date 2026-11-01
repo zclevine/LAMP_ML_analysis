@@ -345,3 +345,75 @@ def test_the_shipped_hourly_ceiling_is_unreachable(app):
     """
     assert app.BUDGET_HOURLY_GPU_HOURS >= float(app.INFER_MAX_CONTAINERS)
     assert app.BUDGET_TOTAL_GPU_HOURS <= app.BUDGET_HOURLY_GPU_HOURS
+
+
+# ---------------------------------------------------------------------------
+# Pricing
+#
+# The ledger gates on GPU-hours, so a wrong rate here cannot refuse or permit
+# work -- but it is the number a human reads to decide whether to keep going,
+# and it silently undercounted by 2.4x for one run after the default GPU moved
+# from L4 to L40S. Hence tests.
+# ---------------------------------------------------------------------------
+
+
+def test_every_priced_gpu_rate_is_positive(app):
+    assert app.GPU_USD_PER_SECOND
+    for name, rate in app.GPU_USD_PER_SECOND.items():
+        assert rate > 0, f"{name} priced at {rate}"
+
+
+def test_the_default_gpu_has_a_published_rate(app):
+    """A default the price table does not know would be priced by fallback."""
+    assert app.GPU in app.GPU_USD_PER_SECOND
+
+
+def test_an_unknown_gpu_falls_back_to_the_default_rate(app):
+    assert app._gpu_rate("H200-SXM-FUTURE") == app.GPU_USD_PER_SECOND[app.GPU]
+
+
+def test_trailing_day_spend_is_priced_per_run_from_its_own_gpu(app, monkeypatch):
+    """Two runs, two GPUs: the cheap one must not be billed at the dear rate."""
+    monkeypatch.setattr(app, "GPU", "L4")
+    app._budget_record(100.0, "on-l4")
+    monkeypatch.setattr(app, "GPU", "L40S")
+    app._budget_record(100.0, "on-l40s")
+
+    expected = 100.0 * app.GPU_USD_PER_SECOND["L4"] + 100.0 * app.GPU_USD_PER_SECOND["L40S"]
+    assert app._budget_usd_last_day() == pytest.approx(expected)
+    # And the whole point: it is not the figure a single-rate sum would give.
+    assert app._budget_usd_last_day() != pytest.approx(200.0 * app.GPU_USD_PER_SECOND["L4"])
+
+
+def test_a_legacy_entry_without_a_gpu_still_counts(app, monkeypatch):
+    """Entries written before the GPU field existed are 3 elements long."""
+    monkeypatch.setattr(app, "GPU", "L4")
+    now = 1_000_000.0
+    app.budget_dict[app._BUDGET_KEY] = {
+        "runs": [[now - 10.0, 50.0, "old-run"]],
+        "total_gpu_seconds": 50.0,
+    }
+    assert app._budget_usd_last_day(now=now) == pytest.approx(
+        50.0 * app.GPU_USD_PER_SECOND["L4"]
+    )
+    # It must also still reach the ceilings, which read the same entries.
+    assert app._budget_usage(now=now)["last_day_gpu_hours"] == pytest.approx(50.0 / HOUR)
+
+
+def test_spend_outside_the_trailing_day_is_not_priced(app, monkeypatch):
+    monkeypatch.setattr(app, "GPU", "L4")
+    now = 1_000_000.0
+    app.budget_dict[app._BUDGET_KEY] = {
+        "runs": [[now - (DAY + 60.0), 500.0, "ancient", "L4"]],
+        "total_gpu_seconds": 500.0,
+    }
+    assert app._budget_usd_last_day(now=now) == 0.0
+
+
+def test_pricing_a_corrupt_entry_does_not_raise(app):
+    """Same fail-soft contract as the rest of the ledger."""
+    app.budget_dict[app._BUDGET_KEY] = {
+        "runs": [["not-a-timestamp", "not-seconds", "bad"], [], None],
+        "total_gpu_seconds": 0.0,
+    }
+    assert app._budget_usd_last_day() == 0.0

@@ -163,13 +163,29 @@ PIP_PINS = (
 # Tunables (deploy-time environment, so you can retune without editing code)
 # ---------------------------------------------------------------------------
 
-#: The GPU is what matters, and the measurement says so: a 5 kb x 10 target x
-#: stride 1 x 4 condition sweep is 7.7 min on one L4 against ~76 min on 8 CPU
-#: cores, a 15x gap, with inference 89% of the run and thermo 10.5%. The
-#: ensemble is small (~100K parameters x 5 seeds, 3.4 GB peak, 18-29% L4
-#: utilization), so a *bigger* GPU buys almost nothing -- more of them is the
-#: lever, which is what `design_fanout` is for.
-GPU = os.environ.get("LAMP_DESIGN_MODAL_GPU", "L4")
+#: The GPU is what matters: a 5 kb x 10 target x stride 1 sweep is minutes on
+#: one GPU against ~76 min on 8 CPU cores.
+#:
+#: L40S is the default because it was measured, head to head, on the same
+#: seeded 10 x 5 kb panel (22,773 candidate sets, 1x2 conditions), both via
+#: `design_single_container`:
+#:
+#:     L4    thermo 11.70s  infer 207.80s  total 220.34 GPU-s  $0.0489
+#:     L40S  thermo  6.83s  infer  76.74s  total  84.07 GPU-s  $0.0456
+#:
+#: So the L40S is 2.6x faster *and* marginally cheaper per run, because its
+#: 2.44x rate ($0.000542/s vs $0.000222/s) is less than its 2.71x speedup on
+#: the inference stage. Results are bit-identical: same 20 sets, same order,
+#: max |diff| 0.0 across every reported score.
+#:
+#: This contradicts what this comment said before -- that the ensemble is
+#: small (~100K parameters x 5 seeds, 3.4 GB peak, 18-29% L4 utilization) so a
+#: bigger GPU "buys almost nothing, more of them is the lever". Low measured
+#: utilization did not mean what it looked like: the stage is latency-bound on
+#: many small sequential kernels, and the L40S has both higher clocks and
+#: enough extra SMs to retire each one faster. Utilization percentage was the
+#: wrong instrument; a stopwatch was the right one.
+GPU = os.environ.get("LAMP_DESIGN_MODAL_GPU", "L40S")
 
 #: GPU containers the inference fan-out spreads shards across. Modal's free
 #: Starter plan allows 10 concurrent GPUs and 100 containers; Team allows 50
@@ -190,8 +206,19 @@ INFER_CPUS = float(os.environ.get("LAMP_DESIGN_INFER_CPUS", "4"))
 
 #: Primer sets per shard. Each shard does its own thermo and inference, so a
 #: shard must do enough work to amortise a container cold start (seconds) plus
-#: loading five checkpoints. At the measured ~2,300 predictions/s and 4
-#: conditions, 2,000 sets is roughly 35s of GPU work per shard.
+#: loading five checkpoints.
+#:
+#: BEWARE: at the current maximum input, fanning out is probably not worth it.
+#: A full stride-1 sweep is 22,773 sets = 84 GPU-s total on one L40S. Split 12
+#: ways that is ~7s of work per shard, against a cold start plus five
+#: checkpoint loads -- measured once at 26.6 GPU-s across 5 shards to do 7.3
+#: GPU-s of work. Fan-out is for *throughput* (many concurrent users) or an
+#: input well beyond the design notes' maximum, not for latency on one run.
+#: One container at ~1.6 min is the better answer for a single design.
+#:
+#: 2,000 is also mis-sized for that input: 22,773 / 2,000 = 12 shards against
+#: INFER_MAX_CONTAINERS = 10, so two shards run in a second wave while eight
+#: GPUs idle. If you do fan out, size this as ceil(n_sets / n_containers).
 INFER_SHARD_SETS = int(os.environ.get("LAMP_DESIGN_INFER_SHARD_SETS", "2000"))
 
 #: Primer sets per chunk, for both the container fan-out and the in-process
@@ -873,6 +900,26 @@ _BUDGET_KEY = "usage"
 _SECONDS_PER_HOUR = 3600.0
 _SECONDS_PER_DAY = 86400.0
 
+#: USD per GPU-second, from modal.com/pricing (checked 2026-11-01). Used only
+#: to turn the ledger's GPU-seconds into an indicative dollar figure; the
+#: breaker itself gates on GPU-hours, so a stale rate here cannot affect
+#: whether work is refused. The authoritative number is the Modal dashboard.
+GPU_USD_PER_SECOND = {
+    "T4": 0.000164,
+    "L4": 0.000222,
+    "A10": 0.000306,
+    "L40S": 0.000542,
+    "A100-40GB": 0.000583,
+    "A100-80GB": 0.000694,
+}
+
+
+def _gpu_rate(name: str) -> float:
+    """Rate for a GPU name, falling back to the configured default's rate."""
+    return GPU_USD_PER_SECOND.get(
+        name, GPU_USD_PER_SECOND.get(GPU, GPU_USD_PER_SECOND["L4"])
+    )
+
 
 class BudgetExceeded(RuntimeError):
     """The spend circuit breaker is open.
@@ -932,6 +979,24 @@ def _budget_usage(now: Optional[float] = None) -> dict:
     }
 
 
+def _budget_usd_last_day(now: Optional[float] = None) -> float:
+    """Trailing-day spend, priced per run from the GPU each one recorded."""
+    moment = time.time() if now is None else now
+    total = 0.0
+    for entry in _budget_state()["runs"]:
+        if not isinstance(entry, (list, tuple)) or len(entry) < 2:
+            continue
+        try:
+            stamp, seconds = float(entry[0]), float(entry[1])
+        except (TypeError, ValueError):
+            continue
+        if moment - stamp > _SECONDS_PER_DAY:
+            continue
+        name = str(entry[3]) if len(entry) >= 4 else GPU
+        total += seconds * _gpu_rate(name)
+    return total
+
+
 def _budget_record(gpu_seconds: float, run_id: str, now: Optional[float] = None) -> None:
     """Add a run's GPU-seconds to the ledger.
 
@@ -951,7 +1016,11 @@ def _budget_record(gpu_seconds: float, run_id: str, now: Optional[float] = None)
             and len(entry) >= 2
             and moment - float(entry[0]) <= _SECONDS_PER_DAY
         ]
-        kept.append([moment, float(gpu_seconds), str(run_id)])
+        # The GPU name is the 4th element. Readers tolerate entries shorter
+        # than this (`len(entry) >= 2`), so entries written before the field
+        # existed still count toward every ceiling -- they just get priced at
+        # the configured default's rate instead of their own.
+        kept.append([moment, float(gpu_seconds), str(run_id), GPU])
         budget_dict[_BUDGET_KEY] = {
             # Bounded so a flood of tiny runs cannot grow the entry without
             # limit; the trailing-hour and trailing-day sums are what matter
@@ -1322,10 +1391,17 @@ def budget_report() -> dict:
             "to_daily": max(0.0, BUDGET_DAILY_GPU_HOURS - usage["last_day_gpu_hours"]),
             "to_total": max(0.0, BUDGET_TOTAL_GPU_HOURS - usage["total_gpu_hours"]),
         },
-        # At the L4 rate from modal.com/pricing. Indicative only -- the
-        # authoritative figure is the Modal dashboard, which also sees spend
-        # this ledger cannot (see "Spend circuit breaker").
-        "approx_usd_spent_at_l4": round(usage["total_gpu_hours"] * 0.000222 * 3600, 4),
+        # Indicative only -- the authoritative figure is the Modal dashboard,
+        # which also sees spend this ledger cannot (see "Spend circuit
+        # breaker"). Two figures because only one of them can be exact:
+        # trailing-day entries carry the GPU they ran on, so that sum is
+        # priced per run; the cumulative total is a bare GPU-second scalar
+        # that survives pruning, so it can only be priced at one rate.
+        "approx_usd_last_day": round(_budget_usd_last_day(), 4),
+        "approx_usd_total_at_default_rate": round(
+            usage["total_gpu_hours"] * _gpu_rate(GPU) * _SECONDS_PER_HOUR, 4
+        ),
+        "default_gpu": GPU,
     }
 
 
