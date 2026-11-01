@@ -50,11 +50,32 @@ LABEL org.opencontainers.image.description="ML-guided LAMP primer set design (CP
 # correction, which shifts every primer Tm by +2.17 C away from the values the
 # model was trained on. The bound must match pyproject.toml -- see the Tm
 # parity test in tests/test_thermo.py.
+#: ViennaRNA is NOT pinned to a version here, and that needs explaining,
+#: because deploy/modal/app.py pins the RNAduplex binary to 2.4.17 and says the
+#: pin is load-bearing -- the installed RNAduplex decides the binding dG every
+#: prediction is conditioned on, and a wrong one does not crash, it quietly
+#: returns different numbers.
+#:
+#: bioconda has no 2.4.17 build for python 3.10 (its newest is py3.9), so the
+#: pin is simply not available on this base. Rather than drop to 3.9 or build
+#: ViennaRNA from source, the image asserts the thing the version pin was ever
+#: a proxy for: that RNAduplex returns the dG values the features were
+#: validated against. See the DG_REFERENCE check in the verify step below,
+#: which is a stronger guarantee than a version string -- it would also catch a
+#: 2.4.17 build that was patched or miscompiled.
+#:
+#: libopenblas is explicit because the `RNA` Python bindings link against it
+#: and conda does not pull it in as a dependency of viennarna. Without it the
+#: binary works, `import RNA` raises
+#: "libopenblas.so.0: cannot open shared object file", and the image fails the
+#: verify step -- which is how this was found. The Dockerfile had never been
+#: built before CI was added.
 RUN micromamba install -y -n base \
         -c pytorch -c bioconda -c conda-forge \
         python=3.10 \
         pytorch cpuonly \
         viennarna \
+        libopenblas \
         mafft \
         "primer3-py>=2.0,<2.1" \
         biopython \
@@ -96,7 +117,8 @@ RUN lamp-design --help > /dev/null \
     && mafft --version 2>&1 | grep -qiE '^v[0-9]' \
     && python -c "import numpy, pandas, Bio, primer3, RNA, scipy, torch" \
     && python -c "import torch, sys; sys.exit(0 if torch.version.cuda is None else 'torch is not the CPU build')" \
-    && python -c "from lamp_design.models.bridge import predict_tp; print('model path imports')"
+    && python -c "from lamp_design.models.bridge import predict_tp; print('model path imports')" \
+    && python /app/scripts/check_dg_reference.py
 
 # Weights are mounted here; nothing is baked in.
 ENV LAMP_DESIGN_WEIGHTS=/weights

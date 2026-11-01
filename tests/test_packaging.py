@@ -20,6 +20,8 @@ import ast
 import pathlib
 import re
 import sys
+import subprocess
+import tempfile
 
 import pytest
 
@@ -187,3 +189,56 @@ def test_the_optional_model_backends_are_still_optional():
     # They are, however, genuinely referenced somewhere -- otherwise this file
     # is asserting about imports that no longer exist.
     assert {"mamba_ssm", "fla"} & _all_imports(tree)
+
+
+# ---------------------------------------------------------------------------
+# dG reference
+#
+# Binding dG is a model input, so an environment that computes it differently
+# produces different designs -- silently. scripts/check_dg_reference.py is the
+# guard; these tests are the guard on the guard.
+# ---------------------------------------------------------------------------
+
+
+def test_the_dg_reference_check_passes_in_this_environment():
+    """The dev environment must itself satisfy what the images are asked to."""
+    script = REPO / "scripts" / "check_dg_reference.py"
+    assert script.exists()
+    done = subprocess.run(
+        [sys.executable, str(script)], capture_output=True, text=True, timeout=300
+    )
+    assert done.returncode == 0, f"{done.stdout}\n{done.stderr}"
+
+
+def test_the_dg_reference_check_fails_on_a_wrong_value():
+    """A check that cannot fail is not a check.
+
+    Verified by perturbing one reference value in a copy, rather than by
+    trusting that the comparison works.
+    """
+    source = (REPO / "scripts" / "check_dg_reference.py").read_text()
+    assert "DG_REFERENCE = [-26.4" in source, "reference literal moved"
+    broken = source.replace("DG_REFERENCE = [-26.4", "DG_REFERENCE = [-99.9")
+    with tempfile.TemporaryDirectory() as tmp:
+        path = pathlib.Path(tmp) / "broken_check.py"
+        path.write_text(broken)
+        done = subprocess.run(
+            [sys.executable, str(path)], capture_output=True, text=True, timeout=300
+        )
+    assert done.returncode != 0, "a wrong reference value was accepted"
+    assert "does not match" in done.stderr
+
+
+def test_both_dockerfiles_run_the_dg_reference_check_or_pin_the_version():
+    """Each image must guard dG one way or the other.
+
+    The CLI image cannot pin ViennaRNA (bioconda has no 2.4.17 for py3.10), so
+    it asserts the dG values instead; the Modal image pins the apt version.
+    Neither may end up doing neither.
+    """
+    cli = (REPO / "Dockerfile").read_text()
+    assert "check_dg_reference.py" in cli, "CLI image does not check dG"
+
+    modal = (REPO / "deploy" / "modal" / "app.py").read_text()
+    assert "RNADUPLEX_EXPECTED_VERSION" in modal
+    assert 'RNAduplex --version | grep -q' in modal, "Modal image does not assert its pin"

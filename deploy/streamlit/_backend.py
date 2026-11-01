@@ -489,9 +489,12 @@ def run_local(request: dict, paths: RunPaths, progress: ProgressFn | None = None
         panel_name=request["run_id"],
     )
     panel = prepared.panel
-    geometries = list(engine("default_geometries")())[: request["n_geometries"]]
+    plan = engine("geometry_plan")(request["n_geometries"])
     slots = engine("count_candidate_slots")(
-        len(panel.consensus), geometries=geometries, stride=request["stride"]
+        len(panel.consensus),
+        geometries=plan["geometries"],
+        n_sampled=plan["n_sampled"],
+        stride=request["stride"],
     )
     prepare_funnel = dict(prepared.diagnostics.as_funnel()) if prepared.diagnostics else {}
     timing["prepare_s"] = time.time() - started
@@ -508,7 +511,8 @@ def run_local(request: dict, paths: RunPaths, progress: ProgressFn | None = None
         conditions=conditions,
         ranking_condition=ranking,
         stride=request["stride"],
-        geometries=geometries,
+        geometries=plan["geometries"],
+        n_sampled=plan["n_sampled"],
         max_candidates=MAX_CANDIDATE_SETS,
         n=request["n_sets"],
         min_separation=request["min_separation"],

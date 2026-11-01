@@ -5,20 +5,33 @@ candidate is the product of two independent choices:
 
 * an **anchor** -- the forward-strand coordinate of the F3 5' end. Anchors are
   taken at ``0, stride, 2*stride, ...``, so position is a single scalar knob.
-* a **geometry** -- a fixed ``(lengths, gaps)`` pair covering all eight primer
-  types, see :class:`Geometry`.
+* a **layout** -- a ``(lengths, gaps)`` pair covering all eight primer types.
 
-Because a geometry's eight windows are fixed integer offsets from the anchor,
-position and geometry are fully decoupled: swapping geometries never moves the
-anchor, and walking the anchor never changes a primer's length. That is the
-deliberate break from the reference implementation
-(``lamp_pipeline/primer_design/tiling.py``), which drew every primer length
-from ``np.random.normal`` inside one cumulative left-to-right walk. There, a
-single long draw shifted the seven downstream primers, so candidate coverage
-depended on the seed, and -- because the reference seeded the *global* numpy
-RNG in ``__init__`` -- two concurrent design runs in one process perturbed each
-other. Nothing in this module consumes randomness; the only RNG offered,
-:func:`random_geometries`, owns a local ``np.random.default_rng(seed)``.
+At every anchor the generator lays down the **canonical** layout
+(:data:`CANONICAL_GAPS` spacing, :data:`CANONICAL_LENGTHS` lengths) plus
+:data:`DEFAULT_N_SAMPLED` layouts drawn per anchor, which is what the design
+notes specify: five primer sets per position, one of them the LML spacing, the
+rest sampled from a normal distribution over the permitted length and gap
+ranges.
+
+So this module *does* consume randomness, and the two failure modes of the
+reference implementation (``lamp_pipeline/primer_design/tiling.py``) are worth
+naming because they are avoided deliberately rather than by accident:
+
+* The reference seeded the **global** numpy RNG in ``__init__``, so two
+  concurrent design runs in one process perturbed each other. Everything here
+  draws from a local ``np.random.default_rng``, passed down explicitly.
+* Sampling made "candidate coverage depend partly on random seed, not just the
+  length bounds" (the design notes' own caveat). The seed is therefore derived
+  from the input by :func:`derive_geometry_seed`, so the same FASTA always
+  returns the same primer sets while each anchor still gets its own draw.
+
+Anchors stay uniformly spaced regardless: the anchor *is* the F3 start, so a
+long draw lengthens the set to the right rather than displacing it, and
+position coverage is unaffected by the layout draws. Only the span varies.
+
+:data:`DEFAULT_GEOMETRIES` remains as an opt-in fixed panel for controlled
+comparisons, where a reproducible candidate count matters more than coverage.
 
 Screens applied here are cheap and purely sequence-local (requirement: no
 thermodynamics in generation -- Tm/ΔG live in ``thermo.py``):
@@ -38,6 +51,7 @@ verbatim and the rest store its reverse complement.
 
 from __future__ import annotations
 
+import hashlib
 import math
 from dataclasses import dataclass, field
 from typing import Dict, List, Mapping, Optional, Sequence, Tuple
@@ -104,6 +118,33 @@ GC_BOUNDS: Tuple[float, float] = (0.2, 0.8)
 #: The spacing the training data occupies, in :data:`GAP_LABELS` order plus an
 #: unused trailing entry so it lines up with ``PRIMER_TYPE_ORDER``.
 CANONICAL_GAPS: Tuple[int, ...] = (5, 0, 0, 5, 0, 0, 5, 0)
+
+#: Per-primer **median** length in the LML datasets, in ``PRIMER_TYPE_ORDER``.
+#:
+#: The design notes specify exactly this for the default geometry: "for our
+#: 'default' primerset at that position, (i.e. with gaps of (5, 0, 0, 5, 0, 0,
+#: 5, 0)), I'd nominate our median primerlengths in the LML datasets, which is
+#: 19-20."
+#:
+#: Measured, not assumed, over LMLv1 + LMLv2 (119,928 sets, 8 primers each):
+#: every type's median is 19 or 20, and the pooled mean is 19.49 --
+#: F3 19, F2 20, FL 20, F1c 20, B1c 19, BL 19, B2 20, B3 20. Spelling out the
+#: per-type medians rather than flattening to a single 20 keeps the default
+#: geometry on the data's actual centre.
+CANONICAL_LENGTHS: Tuple[int, ...] = (19, 20, 20, 20, 19, 19, 20, 20)
+
+#: Sampled geometries laid down at each anchor *in addition to* the canonical
+#: one. Five total per position is what the design notes ask for: "for every
+#: sampled position, I think we have the compute to sample multiple primersets
+#: for that position with different spacings and lengths (i.e. let's say 5).
+#: Because the LML dataset had gaps of (5, 0, 0, 5, 0, 0, 5, 0), I think it
+#: would be helpful to as a rule have one of those 5 primerset spacings."
+DEFAULT_N_SAMPLED: int = 4
+
+#: Divisor turning a bound's width into a standard deviation. The notes
+#: specify "mean at the midpoint of min/max, ~99.7% of draws within range",
+#: i.e. the range spans +/- 3 sigma.
+_SIGMA_DIVISOR: float = 6.0
 
 #: ``geometry_id`` of the canonical geometry.
 CANONICAL_GEOMETRY_ID: str = "canonical"
@@ -265,15 +306,24 @@ def _as_int_tuple(values: Sequence[int], name: str) -> Tuple[int, ...]:
 # The default geometry panel
 # ---------------------------------------------------------------------------
 
-#: Five deterministic geometries. ``canonical`` is the spacing/length the
-#: training data occupies and where the model is best calibrated; the other
-#: four spread over the permitted length and gap ranges so a design run still
-#: sees compact and loose amplicons. Order is stable and so are the ids.
+#: Five deterministic geometries: ``canonical`` plus a fixed spread over the
+#: permitted length and gap ranges.
+#:
+#: NOT the default design panel any more -- see :func:`generate_candidates`,
+#: which lays down ``canonical`` plus :data:`DEFAULT_N_SAMPLED` geometries
+#: drawn per anchor, because that is what the design notes specify. These four
+#: non-canonical entries were a choice of mine, not a requirement, and they
+#: explore exactly five spacings no matter how many positions are tiled.
+#:
+#: They are kept, and selectable with ``--fixed-geometries``, because a fixed
+#: panel is the right instrument for a controlled comparison: the L4-vs-L40S
+#: benchmark in docs/ARCHITECTURE.md used it, and its candidate count has to
+#: stay reproducible for that number to keep meaning anything.
 DEFAULT_GEOMETRIES: Tuple[Geometry, ...] = (
-    # Canonical: (5,0,0,5,0,0,5,0) spacing, every primer 20 nt. Span 175.
+    # Canonical: (5,0,0,5,0,0,5,0) spacing, LML median lengths. Span 172.
     Geometry(
         geometry_id=CANONICAL_GEOMETRY_ID,
-        lengths=(20, 20, 20, 20, 20, 20, 20, 20),
+        lengths=CANONICAL_LENGTHS,
         gaps=CANONICAL_GAPS,
     ),
     # Canonical spacing at the short end of the default 19-20 nt window. Span 167.
@@ -315,8 +365,36 @@ MIN_DESIGNABLE_LENGTH: int = min(g.span for g in DEFAULT_GEOMETRIES)
 
 
 def default_geometries() -> List[Geometry]:
-    """The five default geometries, as a fresh list."""
+    """The five fixed geometries, as a fresh list.
+
+    The *fixed panel*, not the shipped default -- see
+    :func:`generate_candidates` and :func:`geometry_plan`.
+    """
     return list(DEFAULT_GEOMETRIES)
+
+
+def geometry_plan(n_geometries: int, *, fixed: bool = False) -> Dict[str, object]:
+    """``generate_candidates`` kwargs for "``n_geometries`` layouts per anchor".
+
+    One knob for every caller -- the CLI, the Modal harness and the Streamlit
+    backend all speak in "how many geometries per position", and this is the
+    single place that decides what that means.
+
+    ``fixed=False`` (default) gives the design notes' scheme: the canonical
+    layout plus ``n_geometries - 1`` sampled per anchor. ``fixed=True`` gives a
+    prefix of :data:`DEFAULT_GEOMETRIES` and no sampling, for reproducible
+    benchmarking.
+    """
+    if n_geometries < 1:
+        raise ValueError("n_geometries must be >= 1")
+    if fixed:
+        if n_geometries > len(DEFAULT_GEOMETRIES):
+            raise ValueError(
+                f"fixed panel has {len(DEFAULT_GEOMETRIES)} geometries, "
+                f"asked for {n_geometries}"
+            )
+        return {"geometries": list(DEFAULT_GEOMETRIES[:n_geometries]), "n_sampled": 0}
+    return {"geometries": [canonical_geometry()], "n_sampled": n_geometries - 1}
 
 
 def canonical_geometry() -> Geometry:
@@ -363,6 +441,119 @@ def random_geometries(
             )
         )
     return geometries
+
+
+# ---------------------------------------------------------------------------
+# Per-anchor sampling (the design notes' scheme)
+# ---------------------------------------------------------------------------
+
+
+def derive_geometry_seed(template: str, stride: int) -> int:
+    """A seed determined by the input, so a rerun reproduces its own output.
+
+    The design notes ask for sampled lengths and gaps, and the notes also flag
+    the cost of that: "candidate coverage depends partly on random seed, not
+    just the length bounds". Deriving the seed from the template means both
+    hold at once -- each anchor gets its own draw, and the same FASTA always
+    returns the same primer sets. ``stride`` is mixed in because it changes
+    which anchors exist, and a user who changes it should not be told the run
+    is "the same".
+    """
+    digest = hashlib.sha256(f"{stride}:{template}".encode()).digest()
+    # 63 bits: comfortably inside numpy's accepted seed range on all platforms.
+    return int.from_bytes(digest[:8], "big") >> 1
+
+
+def _normal_draws(
+    rng: "np.random.Generator", lo: int, hi: int, size: int
+) -> np.ndarray:
+    """``size`` integer draws from a normal centred in ``[lo, hi]``.
+
+    Mean is the midpoint and sigma is the width over :data:`_SIGMA_DIVISOR`,
+    which is the notes' "mean at the midpoint of min/max, ~99.7% of draws
+    within range". Draws are rounded then clipped, so the ~0.3% that fall
+    outside pile up on the two endpoints rather than being rejected -- a
+    rejection loop would make the number of RNG draws data-dependent and cost
+    the reproducibility that :func:`derive_geometry_seed` buys.
+
+    A pinned range (``lo == hi``, as :data:`GAP_BOUNDS` does for F3-F2 and
+    B2-B3) gives sigma 0 and returns that constant, while still consuming the
+    stream, so the draw sequence does not depend on the bounds.
+    """
+    mean = (lo + hi) / 2.0
+    sigma = (hi - lo) / _SIGMA_DIVISOR
+    drawn = np.rint(rng.normal(mean, sigma, size))
+    return np.clip(drawn, lo, hi).astype(np.int64)
+
+
+def _sampled_layouts(
+    rng: "np.random.Generator",
+    n_anchors: int,
+    length_rules: Mapping[str, Tuple[int, int]],
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Draw one layout per anchor; return ``(start_offsets, end_offsets)``.
+
+    Both are ``(n_anchors, 8)`` in ``PRIMER_TYPE_ORDER``, offsets from the
+    anchor, exactly like :attr:`Geometry.start_offsets` but varying per row.
+    """
+    lengths = np.empty((n_anchors, N_PRIMER_TYPES), dtype=np.int64)
+    for index, primer_type in enumerate(PRIMER_TYPE_ORDER):
+        lo, hi = length_rules[primer_type]
+        lengths[:, index] = _normal_draws(rng, lo, hi, n_anchors)
+
+    # The trailing column stays 0: the unused gap after the last primer.
+    gaps = np.zeros((n_anchors, N_PRIMER_TYPES), dtype=np.int64)
+    for index, (lo, hi) in enumerate(GAP_BOUNDS):
+        gaps[:, index] = _normal_draws(rng, lo, hi, n_anchors)
+
+    starts = np.empty_like(lengths)
+    ends = np.empty_like(lengths)
+    cursor = np.zeros(n_anchors, dtype=np.int64)
+    for index in range(N_PRIMER_TYPES):
+        starts[:, index] = cursor
+        cursor = cursor + lengths[:, index]
+        ends[:, index] = cursor
+        cursor = cursor + gaps[:, index]
+    return starts, ends
+
+
+def _surviving_sampled(
+    anchors: np.ndarray,
+    starts: np.ndarray,
+    ends: np.ndarray,
+    template_length: int,
+    cum_gc: np.ndarray,
+    cum_acgt: np.ndarray,
+) -> np.ndarray:
+    """Rows whose eight windows are in bounds, pure ACGT and GC-ok.
+
+    Same screen as :func:`_surviving_anchors`, but every row has its own
+    offsets, so the per-slot arithmetic is over arrays instead of scalars.
+    Bounds are applied *first*: a row whose span overruns the template would
+    otherwise index the prefix tables out of range.
+    """
+    in_bounds = np.nonzero(anchors + ends[:, -1] <= template_length)[0]
+    if in_bounds.size == 0:
+        return in_bounds
+
+    anchor = anchors[in_bounds]
+    start = starts[in_bounds]
+    end = ends[in_bounds]
+
+    gc_lo, gc_hi = GC_BOUNDS
+    keep = np.ones(in_bounds.size, dtype=bool)
+    for index in range(N_PRIMER_TYPES):
+        window_start = anchor + start[:, index]
+        window_end = anchor + end[:, index]
+        length = end[:, index] - start[:, index]
+        n_gc = cum_gc[window_end] - cum_gc[window_start]
+        n_acgt = cum_acgt[window_end] - cum_acgt[window_start]
+        keep &= n_acgt == length
+        keep &= n_gc >= gc_lo * length - _GC_TOL
+        keep &= n_gc <= gc_hi * length + _GC_TOL
+        if not keep.any():
+            return in_bounds[:0]
+    return in_bounds[keep]
 
 
 # ---------------------------------------------------------------------------
@@ -438,21 +629,33 @@ def count_candidate_slots(
     template_length: int,
     *,
     geometries: Optional[Sequence[Geometry]] = None,
+    n_sampled: int = 0,
     stride: int = 1,
 ) -> int:
-    """Candidates an (anchor x geometry) grid holds *before* any screening.
+    """Candidates an (anchor x layout) grid holds *before* any screening.
 
     Cheap closed form for the ``DesignResult.funnel`` entry that precedes
     generation, so an empty result can say whether the template was simply too
     short or the GC/ACGT screen emptied it.
+
+    Exact for fixed geometries, whose spans are known up front. For
+    ``n_sampled`` slots it is an **estimate**: a sampled layout's span is not
+    known until it is drawn, so each is counted at the canonical span. Sampled
+    spans average wider than canonical (the gap midpoints exceed the LML
+    spacing), so this runs slightly high -- which is the right direction for a
+    pre-flight figure that exists to be compared against what came back.
     """
     if stride < 1:
         raise ValueError("stride must be >= 1")
+    if n_sampled < 0:
+        raise ValueError("n_sampled must be >= 0")
     geoms = default_geometries() if geometries is None else list(geometries)
+    spans = [geometry.span for geometry in geoms]
+    spans.extend([canonical_geometry().span] * n_sampled)
     return sum(
-        max(0, (template_length - geometry.span) // stride + 1)
-        for geometry in geoms
-        if template_length >= geometry.span
+        max(0, (template_length - span) // stride + 1)
+        for span in spans
+        if template_length >= span
     )
 
 
@@ -460,6 +663,8 @@ def generate_candidates(
     template: str,
     *,
     geometries: Optional[Sequence[Geometry]] = None,
+    n_sampled: int = DEFAULT_N_SAMPLED,
+    geometry_seed: Optional[int] = None,
     stride: int = 1,
     length_rules: Optional[Mapping[str, Tuple[int, int]]] = None,
     max_candidates: Optional[int] = None,
@@ -477,10 +682,23 @@ def generate_candidates(
         character inside a primer window is dropped, though one inside an
         inter-primer *gap* is harmless and does not drop the set.
     geometries:
-        Geometries to lay down at each anchor. Defaults to
-        :data:`DEFAULT_GEOMETRIES` (five, canonical included). ``geometry_id``
-        values must be unique. Passing an empty sequence is an error rather
-        than a silent empty result.
+        Fixed geometries to lay down at *every* anchor. Defaults to the
+        canonical one alone, which with ``n_sampled=4`` gives the design
+        notes' five-per-position. Pass :data:`DEFAULT_GEOMETRIES` for the
+        fixed five-geometry panel instead. ``geometry_id`` values must be
+        unique. Passing an empty sequence is an error rather than a silent
+        empty result -- but it is permitted when ``n_sampled > 0``, since the
+        sampled layouts then carry the run.
+    n_sampled:
+        Layouts drawn *per anchor*, in addition to ``geometries``. Lengths are
+        drawn inside ``length_rules`` and gaps inside :data:`GAP_BOUNDS`, both
+        from a normal centred on the midpoint (see :func:`_normal_draws`).
+        0 reproduces the old purely deterministic behaviour.
+    geometry_seed:
+        Seed for the sampled layouts. ``None`` derives one from ``template``
+        and ``stride`` via :func:`derive_geometry_seed`, so the same input
+        reproduces the same sets; pass an int to override. Ignored when
+        ``n_sampled`` is 0.
     stride:
         Anchor step in bases. Sets are generated at anchor ``0, stride,
         2*stride, ...`` up to the last anchor whose B3 end is in bounds.
@@ -498,23 +716,34 @@ def generate_candidates(
 
     Returns
     -------
-    Candidate sets ordered by anchor, then by position in ``geometries``.
-    ``set_id`` is ``f"{geometry_id}@{anchor}"``. A template shorter than the
-    shortest geometry's span yields ``[]``; it is not an error.
+    Candidate sets ordered by anchor, then by slot (fixed geometries first, in
+    the order given, then the sampled layouts). ``set_id`` is
+    ``f"{geometry_id}@{anchor}"``, where a sampled layout's id is
+    ``f"sampled-{slot}"``. A template shorter than the shortest span yields
+    ``[]``; it is not an error.
 
     Notes
     -----
-    Deterministic: no RNG, global or local, is consulted. Two calls with equal
-    arguments return equal output, and the global numpy RNG state is untouched.
+    Reproducible, not RNG-free. With ``n_sampled > 0`` a local
+    ``np.random.default_rng`` is consulted; the global numpy RNG state is never
+    touched or read, so concurrent design runs cannot perturb each other. Two
+    calls with equal arguments return equal output, because the default seed is
+    a function of the input.
+
+    A sampled set's exact lengths and gaps are not recoverable from its
+    ``geometry_id`` alone -- but they are always recoverable from the set
+    itself, since every ``Primer`` carries its ``start`` and ``end``.
     """
     if stride < 1:
         raise ValueError("stride must be >= 1")
     if max_candidates is not None and max_candidates < 0:
         raise ValueError("max_candidates must be >= 0 or None")
+    if n_sampled < 0:
+        raise ValueError("n_sampled must be >= 0")
 
-    geoms = default_geometries() if geometries is None else list(geometries)
-    if not geoms:
-        raise ValueError("geometries must not be empty")
+    geoms = [canonical_geometry()] if geometries is None else list(geometries)
+    if not geoms and n_sampled == 0:
+        raise ValueError("geometries must not be empty when n_sampled is 0")
     seen: Dict[str, int] = {}
     for index, geometry in enumerate(geoms):
         if not isinstance(geometry, Geometry):
@@ -526,10 +755,10 @@ def generate_candidates(
             )
         seen[geometry.geometry_id] = index
 
-    if length_rules is not None:
-        rules = _normalise_length_rules(length_rules)
+    rules = _normalise_length_rules(length_rules)
+    if length_rules is not None and geoms:
         kept = [geometry for geometry in geoms if geometry.fits(rules)]
-        if not kept:
+        if not kept and n_sampled == 0:
             raise ValueError(
                 "length_rules excluded every geometry: "
                 + ", ".join(
@@ -544,75 +773,122 @@ def generate_candidates(
 
     sequence = template.upper()
     template_length = len(sequence)
-    if template_length == 0 or all(
+    if template_length == 0:
+        return []
+    if n_sampled == 0 and all(
         template_length < geometry.span for geometry in geoms
     ):
         return []
 
     cum_gc, cum_acgt = _prefix_tables(sequence)
 
+    # Every slot -- fixed or sampled -- contributes (anchors, starts, ends),
+    # where starts/ends are (n, 8) offsets from the anchor. A fixed geometry's
+    # rows are all identical; a sampled slot's differ per row. Unifying them
+    # here is what lets one build loop serve both.
+    slot_ids: List[str] = []
     anchor_chunks: List[np.ndarray] = []
-    index_chunks: List[np.ndarray] = []
-    for index, geometry in enumerate(geoms):
+    start_chunks: List[np.ndarray] = []
+    end_chunks: List[np.ndarray] = []
+    slot_chunks: List[np.ndarray] = []
+
+    def _add_slot(
+        slot_id: str, anchors: np.ndarray, starts: np.ndarray, ends: np.ndarray
+    ) -> None:
+        if not anchors.size:
+            return
+        slot_chunks.append(np.full(anchors.size, len(slot_ids), dtype=np.int64))
+        slot_ids.append(slot_id)
+        anchor_chunks.append(anchors)
+        start_chunks.append(starts)
+        end_chunks.append(ends)
+
+    for geometry in geoms:
         anchors = _surviving_anchors(
             geometry, template_length, stride, cum_gc, cum_acgt
         )
-        if anchors.size:
-            anchor_chunks.append(anchors)
-            index_chunks.append(np.full(anchors.size, index, dtype=np.int64))
+        _add_slot(
+            geometry.geometry_id,
+            anchors,
+            np.broadcast_to(
+                np.asarray(geometry.start_offsets, dtype=np.int64),
+                (anchors.size, N_PRIMER_TYPES),
+            ),
+            np.broadcast_to(
+                np.asarray(geometry.end_offsets, dtype=np.int64),
+                (anchors.size, N_PRIMER_TYPES),
+            ),
+        )
+
+    if n_sampled:
+        seed = (
+            derive_geometry_seed(sequence, stride)
+            if geometry_seed is None
+            else int(geometry_seed)
+        )
+        rng = np.random.default_rng(seed)
+        # Every anchor at this stride is offered to each sampled slot; the
+        # bounds check lives in `_surviving_sampled`, because a sampled span is
+        # not known until it is drawn.
+        offered = np.arange(0, template_length, stride, dtype=np.int64)
+        for slot in range(n_sampled):
+            starts, ends = _sampled_layouts(rng, offered.size, rules)
+            rows = _surviving_sampled(
+                offered, starts, ends, template_length, cum_gc, cum_acgt
+            )
+            _add_slot(
+                f"sampled-{slot}", offered[rows], starts[rows], ends[rows]
+            )
 
     if not anchor_chunks:
         return []
 
     all_anchors = np.concatenate(anchor_chunks)
-    all_indices = np.concatenate(index_chunks)
-    # Anchor-major, geometry-minor: keeps nearby sets adjacent in the output and
+    all_slots = np.concatenate(slot_chunks)
+    all_starts = np.concatenate(start_chunks)
+    all_ends = np.concatenate(end_chunks)
+    # Anchor-major, slot-minor: keeps nearby sets adjacent in the output and
     # makes the max_candidates thinning below a positional subsample.
-    order = np.lexsort((all_indices, all_anchors))
+    order = np.lexsort((all_slots, all_anchors))
+
+    if max_candidates is not None and order.size > max_candidates:
+        order = order[
+            _thin_by_anchor(all_anchors[order], max_candidates)
+        ]
+
     all_anchors = all_anchors[order]
-    all_indices = all_indices[order]
+    all_slots = all_slots[order]
+    all_starts = all_starts[order]
+    all_ends = all_ends[order]
 
-    if max_candidates is not None and all_anchors.size > max_candidates:
-        all_anchors, all_indices = _thin_by_anchor(
-            all_anchors, all_indices, max_candidates
-        )
-
-    # Per-geometry slot plans, hoisted out of the hot loop.
-    slot_plans = [
-        tuple(
-            (primer_type, start, end, primer_type in FORWARD_STRAND_TYPES)
-            for primer_type, start, end in zip(
-                PRIMER_TYPE_ORDER, geometry.start_offsets, geometry.end_offsets
-            )
-        )
-        for geometry in geoms
-    ]
-    geometry_ids = [geometry.geometry_id for geometry in geoms]
+    forward = tuple(
+        primer_type in FORWARD_STRAND_TYPES for primer_type in PRIMER_TYPE_ORDER
+    )
     # revcomp(sequence[s:e]) == rc_sequence[n - e : n - s], so the reverse-
     # complemented primer types cost one slice instead of a translate per set.
     rc_sequence = _reverse_complement(sequence)
 
     candidates: List[PrimerSet] = []
-    for anchor_value, geometry_index in zip(
-        all_anchors.tolist(), all_indices.tolist()
+    for row, (anchor_value, slot_index) in enumerate(
+        zip(all_anchors.tolist(), all_slots.tolist())
     ):
+        start_row = all_starts[row]
+        end_row = all_ends[row]
         primers: Dict[str, Primer] = {}
-        for primer_type, start_offset, end_offset, is_forward in slot_plans[
-            geometry_index
-        ]:
-            start = anchor_value + start_offset
-            end = anchor_value + end_offset
+        for index, primer_type in enumerate(PRIMER_TYPE_ORDER):
+            start = anchor_value + int(start_row[index])
+            end = anchor_value + int(end_row[index])
             primers[primer_type] = Primer(
                 primer_type=primer_type,
                 sequence=(
                     sequence[start:end]
-                    if is_forward
+                    if forward[index]
                     else rc_sequence[template_length - end : template_length - start]
                 ),
                 start=start,
                 end=end,
             )
-        geometry_id = geometry_ids[geometry_index]
+        geometry_id = slot_ids[slot_index]
         candidates.append(
             PrimerSet(
                 set_id=f"{geometry_id}@{anchor_value}",
@@ -624,27 +900,27 @@ def generate_candidates(
     return candidates
 
 
-def _thin_by_anchor(
-    anchors: np.ndarray, indices: np.ndarray, max_candidates: int
-) -> Tuple[np.ndarray, np.ndarray]:
-    """Keep every ``step``-th anchor whole, then truncate to ``max_candidates``.
+def _thin_by_anchor(anchors: np.ndarray, max_candidates: int) -> np.ndarray:
+    """Positions to keep: every ``step``-th anchor whole, then truncated.
 
-    Thinning whole anchors rather than individual (anchor, geometry) pairs
-    avoids aliasing onto a single geometry when the pair stride happens to be a
-    multiple of the number of geometries.
+    Thinning whole anchors rather than individual (anchor, slot) pairs avoids
+    aliasing onto a single slot when the pair stride happens to be a multiple
+    of the number of slots.
+
+    ``anchors`` must already be sorted anchor-major. Returns indices into it,
+    so the caller can apply the same selection to the parallel offset arrays.
     """
     unique_anchors, first, counts = np.unique(
         anchors, return_index=True, return_counts=True
     )
     step = max(1, math.ceil(anchors.size / max_candidates))
     selected = np.arange(0, unique_anchors.size, step)
-    keep = np.concatenate(
+    return np.concatenate(
         [
             np.arange(first[position], first[position] + counts[position])
             for position in selected
         ]
     )[:max_candidates]
-    return anchors[keep], indices[keep]
 
 
 def _normalise_length_rules(

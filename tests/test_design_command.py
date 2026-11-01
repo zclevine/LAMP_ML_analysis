@@ -22,7 +22,7 @@ from lamp_design.commands.design import (
     load_input_panel,
     resolve_device,
 )
-from lamp_design.generation import default_geometries
+from lamp_design.generation import DEFAULT_N_SAMPLED, default_geometries
 from lamp_design.commands.prepare import InputError
 from lamp_design.types import Condition
 
@@ -174,7 +174,11 @@ def test_design_records_its_own_parameters(tmp_path):
     # Geometry *ids*, not dataclass reprs. This regressed once: Geometry has
     # no `name`, so a `getattr(g, "name", str(g))` here wrote the whole repr
     # into every report -- readable, so nothing failed, but useless as a label.
-    assert p["geometries"] == [g.geometry_id for g in default_geometries()]
+    # The shipped default: the canonical layout plus DEFAULT_N_SAMPLED drawn
+    # per anchor. Recorded by name so a result says which layouts produced it.
+    assert p["geometries"] == ["canonical"] + [
+        f"sampled-{i}" for i in range(DEFAULT_N_SAMPLED)
+    ]
     assert all("Geometry(" not in g for g in p["geometries"])
     # JSON-serializable by construction -- it gets written to the report.
     json.dumps(p)

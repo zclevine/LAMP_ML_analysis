@@ -719,3 +719,54 @@ def test_the_runner_is_invoked_as_a_subprocess_with_a_json_request(monkeypatch, 
     assert _backend.poll_run(job)["state"] == "queued"
     # Run metadata lands on disk when the run starts, not only when it ends.
     assert json.loads(_backend.config_path("r1").read_text())["status"] == "running"
+
+
+# ---------------------------------------------------------------------------
+# The shipped demo panel
+#
+# A first run must not require the user to have a FASTA of their own -- the
+# fastest way to lose someone is to open on an empty file picker.
+# ---------------------------------------------------------------------------
+
+
+def test_the_demo_panel_ships_and_parses():
+    """The file is a deliverable, so its absence is a packaging failure."""
+    import sys
+
+    sys.path.insert(0, str(APP_DIR))
+    import app as portal  # noqa: PLC0415
+
+    assert portal.DEMO_PANELS, "at least one demo panel must be offered"
+    for label, (relative, blurb) in portal.DEMO_PANELS.items():
+        path = portal._demo_root() / relative
+        assert path.exists(), f"{label} -> missing {relative}"
+        text = path.read_text()
+        assert text.startswith(">"), f"{relative} is not FASTA"
+        assert blurb.strip(), f"{label} has no description"
+        # The engine rejects ambiguity codes, so a demo containing them would
+        # fail on the user's first click -- the worst possible place.
+        bases = set(
+            "".join(
+                line.strip().upper()
+                for line in text.splitlines()
+                if not line.startswith(">")
+            )
+        )
+        assert bases <= set("ACGT"), f"{relative} has non-ACGT: {sorted(bases - set('ACGT'))}"
+
+
+def test_the_demo_panel_is_within_the_engines_input_limits():
+    import sys
+
+    sys.path.insert(0, str(APP_DIR))
+    import app as portal  # noqa: PLC0415
+    from lamp_design.utils.sequences import read_fasta  # noqa: PLC0415
+
+    for relative, _ in portal.DEMO_PANELS.values():
+        path = portal._demo_root() / relative
+        records = read_fasta(str(path))
+        longest = max(len(seq) for _, seq in records)
+        assert len(records) * longest <= _engine_api.MAX_BUDGET, (
+            f"{relative} is {len(records)} x {longest} = "
+            f"{len(records) * longest:,}, over the {_engine_api.MAX_BUDGET:,} budget"
+        )

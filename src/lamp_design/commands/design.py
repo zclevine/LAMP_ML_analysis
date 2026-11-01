@@ -35,8 +35,12 @@ from lamp_design.commands.prepare import (
     prepare_panel,
 )
 from lamp_design.generation import (
+    DEFAULT_GEOMETRIES,
+    DEFAULT_N_SAMPLED,
     DEFAULT_STRIDE,
+    canonical_geometry,
     default_geometries,
+    geometry_plan,
     random_geometries,
 )
 from lamp_design.report import (
@@ -232,6 +236,8 @@ def design(
     ranking_condition: Optional[Condition] = None,
     stride: int = DEFAULT_STRIDE,
     geometries: Optional[Sequence] = None,
+    n_sampled: int = DEFAULT_N_SAMPLED,
+    geometry_seed: Optional[int] = None,
     max_candidates: Optional[int] = None,
     n: int = DEFAULT_N_SETS,
     min_separation: int = DEFAULT_MIN_SEPARATION_BP,
@@ -261,7 +267,10 @@ def design(
     device = resolve_device(device)
     if batch_size is None:
         batch_size = BATCH_SIZE_GPU if device.startswith("cuda") else BATCH_SIZE_CPU
-    geometries = list(geometries) if geometries else default_geometries()
+    # The canonical layout alone by default; `n_sampled` others are drawn per
+    # anchor inside generate_candidates. Pass `geometries=DEFAULT_GEOMETRIES,
+    # n_sampled=0` for the fixed panel.
+    geometries = list(geometries) if geometries else [canonical_geometry()]
 
     timings: Dict[str, float] = {}
 
@@ -269,6 +278,8 @@ def design(
     candidates = generate_candidates(
         panel.consensus,
         geometries=geometries,
+        n_sampled=n_sampled,
+        geometry_seed=geometry_seed,
         stride=stride,
         max_candidates=max_candidates,
     )
@@ -327,6 +338,9 @@ def design(
             # dataclass repr instead of 'canonical'.
             "geometries": [
                 getattr(g, "geometry_id", None) or str(g) for g in geometries
+            ]
+            + [
+                f"sampled-{i}" for i in range(n_sampled)
             ],
             "conditions": [str(c) for c in conditions],
             "ranking_condition": str(ranking_condition),
@@ -432,11 +446,21 @@ coverage for time: stride 1 evaluates every anchor position.
         help="Hard cap on candidate sets, applied during generation",
     )
     parser.add_argument(
-        "--random-geometries", dest="random_geometries", type=int, default=None,
-        help="Use N randomly-sampled geometries instead of the deterministic set",
+        "--n-geometries", dest="n_geometries", type=int, default=1 + DEFAULT_N_SAMPLED,
+        help="Layouts per position: canonical plus N-1 sampled (default: %(default)s)",
     )
     parser.add_argument(
-        "--geometry-seed", dest="geometry_seed", type=int, default=0,
+        "--fixed-geometries", dest="fixed_geometries", action="store_true",
+        help="Use the fixed geometry panel and no per-anchor sampling "
+             "(reproducible candidate counts, only 5 distinct layouts)",
+    )
+    parser.add_argument(
+        "--random-geometries", dest="random_geometries", type=int, default=None,
+        help="Legacy: N uniformly-sampled geometries applied at every anchor, "
+             "no per-anchor sampling",
+    )
+    parser.add_argument(
+        "--geometry-seed", dest="geometry_seed", type=int, default=None,
         help="Seed for --random-geometries (default: %(default)s)",
     )
     parser.add_argument(
@@ -487,11 +511,16 @@ def run(args) -> DesignResult:
     ranking_condition = _ranking_condition(
         conditions, args.rank_master_mix, args.rank_conc
     )
-    geometries = (
-        random_geometries(args.random_geometries, seed=args.geometry_seed)
-        if args.random_geometries
-        else default_geometries()
-    )
+    if args.random_geometries:
+        # Legacy path: fixed geometries, sampled once, applied at every anchor.
+        plan = {
+            "geometries": random_geometries(
+                args.random_geometries, seed=args.geometry_seed
+            ),
+            "n_sampled": 0,
+        }
+    else:
+        plan = geometry_plan(args.n_geometries, fixed=args.fixed_geometries)
 
     started = time.perf_counter()
     result = design(
@@ -500,7 +529,9 @@ def run(args) -> DesignResult:
         conditions=conditions,
         ranking_condition=ranking_condition,
         stride=args.stride,
-        geometries=geometries,
+        geometries=plan["geometries"],
+        n_sampled=plan["n_sampled"],
+        geometry_seed=args.geometry_seed,
         max_candidates=args.max_candidates,
         n=args.top,
         min_separation=args.min_separation,

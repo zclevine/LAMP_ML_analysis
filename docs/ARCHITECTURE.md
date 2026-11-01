@@ -89,9 +89,10 @@ Settled with the team; don't silently revert these.
   exclude essentially all of the training distribution (every LML primer type
   sits near 58 °C). Tm is a model *input*, not a filter.
 - **Permissive GC (20–80%)** — matches the LML design space.
-- **Deterministic geometries.** Enumerate a small fixed set of spacing/length
-  geometries per anchor, including the canonical `(5,0,0,5,0,0,5,0)` spacing at
-  length 19–20, which is where the model is best calibrated. No global RNG.
+- **Canonical plus sampled geometries, five per anchor.** See
+  [Geometry sampling](#geometry-sampling) — this one was changed, because an
+  earlier version of this list said "deterministic geometries, a small fixed
+  set" and that was not what the design notes asked for.
 - **Dimer ΔG as a filter.** The model never saw non-specific amplification, so
   homo/heterodimer screening has to happen outside it.
 - **Input cap on `n_targets × alignment_length`**, not sequence count.
@@ -284,6 +285,54 @@ Numerical agreement across all of the above:
 - GPU vs CPU: max |ΔTp| = **8.0 × 10⁻⁵ min**, mean 1.3 × 10⁻⁵ — floating-point
   noise from different FFT implementations, on predictions spanning 0–60 min.
   The GPU path is not an approximation.
+
+### Geometry sampling
+
+At every anchor the generator lays down the **canonical** layout plus four
+drawn per anchor. That is the design notes' scheme, quoted from them:
+
+> "for every sampled position, I think we have the compute to sample multiple
+> primersets for that position with different spacings and lengths (i.e. let's
+> say 5). Because the LML dataset had gaps of (5, 0, 0, 5, 0, 0, 5, 0), I think
+> it would be helpful to as a rule have one of those 5 primerset spacings"
+>
+> "for our 'default' primerset at that position ... I'd nominate our median
+> primerlengths in the LML datasets, which is 19-20."
+
+So `CANONICAL_LENGTHS` is **measured, not chosen**: the per-type median over
+LMLv1 + LMLv2 (119,928 sets) is F3 19, F2 20, FL 20, F1c 20, B1c 19, BL 19,
+B2 20, B3 20, pooled mean 19.49. The other four draw lengths inside
+`LENGTH_BOUNDS` and gaps inside `GAP_BOUNDS` from a normal centred on each
+range's midpoint with σ = width/6 — the notes' "mean at the midpoint of
+min/max, ~99.7% of draws within range". Draws are clipped rather than
+rejected, so the bounds are hard and the number of RNG draws stays independent
+of the data.
+
+**Why this replaced a fixed panel.** The repo previously shipped five fixed
+geometries, four of which were an implementer's choice rather than a
+requirement. A fixed panel explores exactly five spacings however many
+positions are tiled; per-anchor sampling explores one per candidate. Measured
+on a 3 kb template at stride 1: **18,116 distinct layouts against 5**, at the
+same candidate count and the same inference cost. The diversity is free.
+
+**Reproducibility is kept, not traded away.** The notes flag the cost of
+sampling themselves — "candidate coverage depends partly on random seed, not
+just the length bounds" — so the seed is derived from the input
+(`derive_geometry_seed`, sha256 of stride + template). The same FASTA always
+returns the same sets, while each anchor still gets its own draw;
+`--geometry-seed` overrides. Everything draws from a local
+`np.random.default_rng`, never the global numpy RNG, so concurrent design runs
+in one process cannot perturb each other — which the reference implementation
+did.
+
+Anchors stay uniformly spaced either way: the anchor *is* the F3 start, so a
+long draw extends the set rightward instead of displacing it. Only the span
+varies, which is why `count_candidate_slots` is exact for fixed geometries and
+an estimate for sampled ones.
+
+`DEFAULT_GEOMETRIES` survives as an opt-in fixed panel (`--fixed-geometries`),
+because a reproducible candidate count is the right instrument for a
+controlled comparison — the L4-vs-L40S benchmark below used it.
 
 ### The full sweep, measured end to end
 

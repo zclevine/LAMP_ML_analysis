@@ -18,7 +18,9 @@ from Bio.Seq import Seq
 from lamp_design.generation import (
     CANONICAL_GAPS,
     CANONICAL_GEOMETRY_ID,
+    CANONICAL_LENGTHS,
     DEFAULT_GEOMETRIES,
+    DEFAULT_N_SAMPLED,
     GAP_BOUNDS,
     GAP_LABELS,
     GC_BOUNDS,
@@ -27,9 +29,11 @@ from lamp_design.generation import (
     canonical_geometry,
     count_candidate_slots,
     default_geometries,
+    derive_geometry_seed,
     generate_candidates,
     random_geometries,
 )
+from lamp_design.generation import _normal_draws
 from lamp_design.types import FORWARD_STRAND_TYPES, PRIMER_TYPE_ORDER
 
 # ---------------------------------------------------------------------------
@@ -68,6 +72,21 @@ HAND_TEMPLATE = (
     + "ACGT"  # tail, so anchor 0 is not the only anchor that fits
 )
 
+
+def fixed(template, **kwargs):
+    """``generate_candidates`` over the deterministic fixed panel.
+
+    The shipped default is ``canonical`` plus four layouts sampled per anchor
+    (the design notes' scheme), so the closed-form counts and
+    "every geometry appears" invariants below are about the *fixed* panel,
+    which is still a supported mode and still has an exact closed form. Tests
+    for the sampled default live in their own section at the end of the file.
+    """
+    kwargs.setdefault("geometries", DEFAULT_GEOMETRIES)
+    kwargs.setdefault("n_sampled", 0)
+    return generate_candidates(template, **kwargs)
+
+
 #: Hand-computed windows at anchor 0 for MIN15.
 HAND_COORDS = {
     "F3": (0, 15),
@@ -85,6 +104,25 @@ def all_pass(length: int) -> str:
     """``ACGT`` repeat: pure ACGT and every window's GC fraction near 0.5, so
     no candidate is ever dropped by the cheap screen."""
     return ("ACGT" * (length // 4 + 1))[:length]
+
+
+def random_template(length: int, seed: int) -> str:
+    """Seeded random ACGT, for when two *different* templates are needed."""
+    rng = np.random.default_rng(seed)
+    return "".join(rng.choice(list("ACGT"), size=length))
+
+
+def _layout_of(primer_set) -> tuple:
+    """``(lengths, gaps)`` recovered from a set's primer coordinates.
+
+    Deliberately reconstructed from the output rather than read off a
+    Geometry: a sampled set has no Geometry object, and this is exactly the
+    route a user has to take to recover one from a result file.
+    """
+    primers = primer_set.ordered()
+    lengths = tuple(p.length for p in primers)
+    gaps = tuple(primers[i + 1].start - primers[i].end for i in range(len(primers) - 1))
+    return lengths + gaps
 
 
 def expected_count(template_length: int, geometries, stride: int) -> int:
@@ -105,7 +143,7 @@ def one_set(template: str, geometry: Geometry, anchor: int = 0):
     """The single set produced by ``geometry`` at ``anchor``."""
     sets = [
         candidate
-        for candidate in generate_candidates(template, geometries=[geometry])
+        for candidate in fixed(template, geometries=[geometry])
         if candidate.anchor == anchor
     ]
     assert len(sets) == 1
@@ -148,18 +186,22 @@ def test_canonical_geometry_is_present_and_correct():
     assert canonical.gaps == (5, 0, 0, 5, 0, 0, 5, 0)
     assert set(canonical.lengths) <= {19, 20}
     assert len(canonical.lengths) == len(PRIMER_TYPE_ORDER)
-    # hand-computed layout for all-20 canonical spacing
+    # Hand-computed from CANONICAL_LENGTHS (the LML per-type medians,
+    # 19/20/20/20/19/19/20/20) and CANONICAL_GAPS (5,0,0,5,0,0,5):
+    #   F3 19 +5 | F2 20 +0 | FL 20 +0 | F1c 20 +5 | B1c 19 +0 | BL 19 +0
+    #   | B2 20 +5 | B3 20
+    assert canonical.lengths == CANONICAL_LENGTHS
     assert canonical.windows(0) == [
-        ("F3", 0, 20),
-        ("F2", 25, 45),
-        ("FL", 45, 65),
-        ("F1c", 65, 85),
-        ("B1c", 90, 110),
-        ("BL", 110, 130),
-        ("B2", 130, 150),
-        ("B3", 155, 175),
+        ("F3", 0, 19),
+        ("F2", 24, 44),
+        ("FL", 44, 64),
+        ("F1c", 64, 84),
+        ("B1c", 89, 108),
+        ("BL", 108, 127),
+        ("B2", 127, 147),
+        ("B3", 152, 172),
     ]
-    assert canonical.span == 175
+    assert canonical.span == 172
 
 
 def test_panel_spreads_over_the_design_space():
@@ -194,7 +236,11 @@ def test_geometry_offsets_are_anchor_relative():
 def test_geometry_accepts_seven_gaps_and_normalises_to_eight():
     seven = Geometry(geometry_id="g7", lengths=(19,) * 8, gaps=(5, 0, 0, 5, 0, 0, 5))
     assert seven.gaps == CANONICAL_GAPS
-    assert seven.span == canonical_geometry().span - 8
+    # 8 x 19 nt plus the three 5 nt canonical gaps. Computed here rather than
+    # as an offset from canonical_geometry(), which no longer has uniform
+    # lengths -- that coupling is what made this test fail when the canonical
+    # geometry moved onto the LML per-type medians.
+    assert seven.span == 8 * 19 + 15 == 167
 
 
 @pytest.mark.parametrize(
@@ -258,7 +304,7 @@ def test_hand_computed_set_matches_frozen_strand_convention():
 def test_strand_assignment_matches_forward_strand_types_exactly():
     """Independent oracle (Biopython) over every default geometry."""
     template = all_pass(400)
-    candidates = generate_candidates(template, stride=7)
+    candidates = fixed(template, stride=7)
     assert candidates
     seen_types = set()
     for primer_set in candidates:
@@ -288,7 +334,7 @@ def test_reverse_complement_is_not_merely_complement_or_reverse():
 
 
 def test_every_set_is_complete_and_ordered():
-    for primer_set in generate_candidates(all_pass(300), stride=11):
+    for primer_set in fixed(all_pass(300), stride=11):
         assert set(primer_set.primers) == set(PRIMER_TYPE_ORDER)
         ordered = primer_set.ordered()
         assert [p.primer_type for p in ordered] == list(PRIMER_TYPE_ORDER)
@@ -304,7 +350,7 @@ def test_every_set_is_complete_and_ordered():
 def test_anchor_is_the_f3_start_and_geometry_does_not_move_it():
     template = all_pass(600)
     by_anchor = {}
-    for primer_set in generate_candidates(template, stride=100):
+    for primer_set in fixed(template, stride=100):
         by_anchor.setdefault(primer_set.anchor, []).append(primer_set)
     for anchor, sets in by_anchor.items():
         assert len({frozenset([s.geometry_id]) for s in sets}) == len(sets)
@@ -320,8 +366,8 @@ def test_anchor_is_the_f3_start_and_geometry_does_not_move_it():
 
 def test_two_calls_give_identical_output():
     template = all_pass(500)
-    first = generate_candidates(template, stride=3)
-    second = generate_candidates(template, stride=3)
+    first = fixed(template, stride=3)
+    second = fixed(template, stride=3)
     assert [s.set_id for s in first] == [s.set_id for s in second]
     assert [s.anchor for s in first] == [s.anchor for s in second]
     assert [s.geometry_id for s in first] == [s.geometry_id for s in second]
@@ -335,7 +381,7 @@ def test_generation_does_not_touch_the_global_numpy_rng():
     np.random.seed(123)
     np.random.random(5)  # move off the freshly-seeded state
     before = rng_state_fingerprint()
-    candidates = generate_candidates(all_pass(1200), stride=2, max_candidates=100)
+    candidates = fixed(all_pass(1200), stride=2, max_candidates=100)
     assert candidates
     assert rng_state_fingerprint() == before
 
@@ -343,9 +389,9 @@ def test_generation_does_not_touch_the_global_numpy_rng():
 def test_global_rng_state_does_not_change_the_result():
     template = all_pass(400)
     np.random.seed(0)
-    first = [s.set_id for s in generate_candidates(template)]
+    first = [s.set_id for s in fixed(template)]
     np.random.seed(999)
-    second = [s.set_id for s in generate_candidates(template)]
+    second = [s.set_id for s in fixed(template)]
     assert first == second
 
 
@@ -376,7 +422,7 @@ def test_random_geometries_honours_length_rules():
 
 
 def test_set_ids_are_unique_and_identify_geometry_and_anchor():
-    candidates = generate_candidates(all_pass(700), stride=5)
+    candidates = fixed(all_pass(700), stride=5)
     assert len({s.set_id for s in candidates}) == len(candidates)
     for primer_set in candidates:
         assert primer_set.set_id == f"{primer_set.geometry_id}@{primer_set.anchor}"
@@ -392,7 +438,7 @@ def test_anchor_spacing_follows_stride(stride):
     template = all_pass(500)
     geometry = canonical_geometry()
     anchors = [
-        s.anchor for s in generate_candidates(template, geometries=[geometry], stride=stride)
+        s.anchor for s in fixed(template, geometries=[geometry], stride=stride)
     ]
     assert anchors == list(range(0, len(template) - geometry.span + 1, stride))
 
@@ -401,35 +447,35 @@ def test_anchor_spacing_follows_stride(stride):
 @pytest.mark.parametrize("length", [200, 500, 1000])
 def test_candidate_count_matches_the_closed_form(length, stride):
     template = all_pass(length)
-    candidates = generate_candidates(template, stride=stride)
+    candidates = fixed(template, stride=stride)
     assert len(candidates) == expected_count(length, DEFAULT_GEOMETRIES, stride)
     assert len(candidates) == count_candidate_slots(length, stride=stride)
 
 
 def test_count_scales_with_template_length_and_inversely_with_stride():
-    short = len(generate_candidates(all_pass(1000)))
-    long = len(generate_candidates(all_pass(2000)))
+    short = len(fixed(all_pass(1000)))
+    long = len(fixed(all_pass(2000)))
     # every geometry gains exactly 1000 anchors
     assert long - short == 1000 * len(DEFAULT_GEOMETRIES)
-    strided = len(generate_candidates(all_pass(1000), stride=10))
+    strided = len(fixed(all_pass(1000), stride=10))
     assert short / 11 < strided < short / 9
 
 
 def test_every_default_geometry_is_represented():
-    counts = Counter(s.geometry_id for s in generate_candidates(all_pass(1000)))
+    counts = Counter(s.geometry_id for s in fixed(all_pass(1000)))
     assert set(counts) == {g.geometry_id for g in DEFAULT_GEOMETRIES}
     assert all(count > 0 for count in counts.values())
 
 
 def test_output_is_ordered_by_anchor():
-    anchors = [s.anchor for s in generate_candidates(all_pass(400), stride=3)]
+    anchors = [s.anchor for s in fixed(all_pass(400), stride=3)]
     assert anchors == sorted(anchors)
 
 
 def test_coordinates_stay_in_bounds():
     for length in (170, 171, 260, 261, 999):
         template = all_pass(length)
-        for primer_set in generate_candidates(template, stride=1):
+        for primer_set in fixed(template, stride=1):
             for primer in primer_set.ordered():
                 assert 0 <= primer.start < primer.end <= length
                 assert primer.end - primer.start == len(primer.sequence)
@@ -439,7 +485,7 @@ def test_coordinates_stay_in_bounds():
 def test_template_exactly_one_span_long_yields_one_set():
     geometry = canonical_geometry()
     template = all_pass(geometry.span)
-    candidates = generate_candidates(template, geometries=[geometry])
+    candidates = fixed(template, geometries=[geometry])
     assert len(candidates) == 1
     assert candidates[0].anchor == 0
     assert candidates[0].span == (0, geometry.span)
@@ -447,12 +493,12 @@ def test_template_exactly_one_span_long_yields_one_set():
 
 @pytest.mark.parametrize("length", [0, 1, 10, 100, 161])
 def test_short_templates_return_zero_candidates_without_raising(length):
-    assert generate_candidates(all_pass(length)) == []
+    assert fixed(all_pass(length)) == []
 
 
 def test_template_shorter_than_one_span_still_uses_the_others():
     """A 170 bp template fits the three short geometries, not the two long ones."""
-    candidates = generate_candidates(all_pass(170))
+    candidates = fixed(all_pass(170))
     used = {s.geometry_id for s in candidates}
     assert used == {"canonical-19", "short-compact"}  # canonical span is 175
 
@@ -463,15 +509,15 @@ def test_template_shorter_than_one_span_still_uses_the_others():
 
 
 def test_gc_poor_template_yields_nothing():
-    assert generate_candidates("AT" * 500) == []
+    assert fixed("AT" * 500) == []
 
 
 def test_gc_rich_template_yields_nothing():
-    assert generate_candidates("GC" * 500) == []
+    assert fixed("GC" * 500) == []
 
 
 def test_balanced_template_yields_candidates():
-    assert generate_candidates(all_pass(1000))
+    assert fixed(all_pass(1000))
 
 
 def test_gc_bounds_are_inclusive_at_both_ends():
@@ -481,14 +527,17 @@ def test_gc_bounds_are_inclusive_at_both_ends():
     compared against ``0.2 * 20`` in IEEE-754 floating point is the exact case
     a naive comparison gets wrong.
     """
-    geometry = canonical_geometry()
+    # An all-20 geometry, not the canonical one: the exact-boundary arithmetic
+    # this test exists for needs every primer length divisible by the repeat
+    # period, and canonical is 19/20 mixed (the LML medians).
+    geometry = Geometry(geometry_id="all20", lengths=(20,) * 8, gaps=CANONICAL_GAPS)
     assert set(geometry.lengths) == {20}
     low = "AATTG" * 40
     high = "GGCCA" * 40
     assert (low.count("G") + low.count("C")) / len(low) == pytest.approx(GC_BOUNDS[0])
     assert (high.count("G") + high.count("C")) / len(high) == pytest.approx(GC_BOUNDS[1])
     for template in (low, high):
-        candidates = generate_candidates(template, geometries=[geometry])
+        candidates = fixed(template, geometries=[geometry])
         assert len(candidates) == len(template) - geometry.span + 1
         for primer in candidates[0].ordered():
             gc = sum(base in "GC" for base in primer.sequence) / primer.length
@@ -500,16 +549,16 @@ def test_gc_outside_the_window_drops_only_the_offending_sets():
     start, end = HAND_COORDS["F1c"]
     template = HAND_TEMPLATE[:start] + "A" * (end - start) + HAND_TEMPLATE[end:]
     assert len(template) == len(HAND_TEMPLATE)
-    anchors = {s.anchor for s in generate_candidates(template, geometries=[MIN15])}
+    anchors = {s.anchor for s in fixed(template, geometries=[MIN15])}
     assert 0 not in anchors
-    all_anchors = {s.anchor for s in generate_candidates(HAND_TEMPLATE, geometries=[MIN15])}
+    all_anchors = {s.anchor for s in fixed(HAND_TEMPLATE, geometries=[MIN15])}
     assert 0 in all_anchors
     assert anchors < all_anchors
 
 
 def test_non_acgt_inside_a_primer_window_drops_the_set():
     template = "N" + HAND_TEMPLATE[1:]  # position 0 is inside F3 at anchor 0
-    anchors = {s.anchor for s in generate_candidates(template, geometries=[MIN15])}
+    anchors = {s.anchor for s in fixed(template, geometries=[MIN15])}
     assert 0 not in anchors
 
 
@@ -517,7 +566,7 @@ def test_non_acgt_inside_a_gap_is_tolerated():
     """Only primer windows are screened; the inter-primer gaps are not."""
     template = HAND_TEMPLATE[:17] + "N" + HAND_TEMPLATE[18:]  # 15:20 is the F3-F2 gap
     assert len(template) == len(HAND_TEMPLATE)
-    anchors = {s.anchor for s in generate_candidates(template, geometries=[MIN15])}
+    anchors = {s.anchor for s in fixed(template, geometries=[MIN15])}
     assert 0 in anchors
 
 
@@ -528,7 +577,7 @@ def test_every_non_acgt_character_is_rejected(bad):
     poisoned = template[:position] + bad + template[position + 1 :]
     anchors = {
         s.anchor
-        for s in generate_candidates(poisoned, geometries=[canonical_geometry()])
+        for s in fixed(poisoned, geometries=[canonical_geometry()])
     }
     assert 0 not in anchors
 
@@ -557,7 +606,7 @@ def test_vectorized_screen_matches_a_pure_python_screen():
             ):
                 expected.add((geometry.geometry_id, anchor))
 
-    actual = {(s.geometry_id, s.anchor) for s in generate_candidates(template)}
+    actual = {(s.geometry_id, s.anchor) for s in fixed(template)}
     assert 0 < len(expected) < count_candidate_slots(len(template))  # non-trivial
     assert actual == expected
 
@@ -582,7 +631,7 @@ def test_no_tm_filter_is_applied(template):
     repeats melt near 40 C and ``GGCCA`` repeats well above 70 C; both are
     inside the permissive GC window, so both must come through.
     """
-    candidates = generate_candidates(template, geometries=[canonical_geometry()])
+    candidates = fixed(template, geometries=[canonical_geometry()])
     assert candidates
 
     primer3 = pytest.importorskip("primer3")
@@ -601,7 +650,7 @@ def test_no_tm_filter_is_applied(template):
 def test_length_rules_filter_the_geometry_panel():
     template = all_pass(1000)
     rules = {primer_type: (19, 20) for primer_type in PRIMER_TYPE_ORDER}
-    used = {s.geometry_id for s in generate_candidates(template, length_rules=rules)}
+    used = {s.geometry_id for s in fixed(template, length_rules=rules)}
     assert used == {"canonical", "canonical-19"}
 
 
@@ -609,32 +658,32 @@ def test_partial_length_rules_only_constrain_the_named_types():
     template = all_pass(1000)
     used = {
         s.geometry_id
-        for s in generate_candidates(template, length_rules={"F3": (16, 16)})
+        for s in fixed(template, length_rules={"F3": (16, 16)})
     }
     assert used == {"short-compact"}  # the only geometry with a 16 nt F3
 
 
 def test_length_rules_that_exclude_everything_raise():
     with pytest.raises(ValueError, match="excluded every geometry"):
-        generate_candidates(all_pass(1000), length_rules={"F3": (15, 15)})
+        fixed(all_pass(1000), length_rules={"F3": (15, 15)})
 
 
 def test_length_rules_reject_unknown_primer_types():
     with pytest.raises(ValueError, match="unknown primer types"):
-        generate_candidates(all_pass(400), length_rules={"LF": (19, 20)})
+        fixed(all_pass(400), length_rules={"LF": (19, 20)})
 
 
 def test_length_rules_reject_inverted_or_impossible_bounds():
     with pytest.raises(ValueError):
-        generate_candidates(all_pass(400), length_rules={"F3": (22, 18)})
+        fixed(all_pass(400), length_rules={"F3": (22, 18)})
     with pytest.raises(ValueError, match="permitted length range"):
-        generate_candidates(all_pass(400), length_rules={"F3": (30, 40)})
+        fixed(all_pass(400), length_rules={"F3": (30, 40)})
 
 
 def test_max_candidates_caps_the_result_and_keeps_coverage():
     template = all_pass(2000)
-    total = len(generate_candidates(template))
-    capped = generate_candidates(template, max_candidates=50)
+    total = len(fixed(template))
+    capped = fixed(template, max_candidates=50)
     assert total > 50
     assert len(capped) == 50
     # still spread across the template and across geometries, not a prefix
@@ -645,25 +694,25 @@ def test_max_candidates_caps_the_result_and_keeps_coverage():
 
 def test_max_candidates_above_the_total_changes_nothing():
     template = all_pass(400)
-    full = generate_candidates(template)
-    assert [s.set_id for s in generate_candidates(template, max_candidates=10**6)] == [
+    full = fixed(template)
+    assert [s.set_id for s in fixed(template, max_candidates=10**6)] == [
         s.set_id for s in full
     ]
 
 
 @pytest.mark.parametrize("cap", [1, 2, 7, 13])
 def test_max_candidates_is_exact(cap):
-    assert len(generate_candidates(all_pass(1500), max_candidates=cap)) == cap
+    assert len(fixed(all_pass(1500), max_candidates=cap)) == cap
 
 
 def test_max_candidates_zero_returns_empty():
-    assert generate_candidates(all_pass(1000), max_candidates=0) == []
+    assert fixed(all_pass(1000), max_candidates=0) == []
 
 
 def test_max_candidates_is_deterministic():
     template = all_pass(3000)
-    first = [s.set_id for s in generate_candidates(template, max_candidates=77)]
-    second = [s.set_id for s in generate_candidates(template, max_candidates=77)]
+    first = [s.set_id for s in fixed(template, max_candidates=77)]
+    second = [s.set_id for s in fixed(template, max_candidates=77)]
     assert first == second
 
 
@@ -675,28 +724,28 @@ def test_max_candidates_is_deterministic():
 @pytest.mark.parametrize("stride", [0, -1])
 def test_stride_must_be_positive(stride):
     with pytest.raises(ValueError, match="stride"):
-        generate_candidates(all_pass(400), stride=stride)
+        fixed(all_pass(400), stride=stride)
 
 
 def test_empty_geometry_list_is_an_error_not_an_empty_result():
     with pytest.raises(ValueError, match="geometries must not be empty"):
-        generate_candidates(all_pass(400), geometries=[])
+        fixed(all_pass(400), geometries=[])
 
 
 def test_duplicate_geometry_ids_are_rejected():
     geometry = canonical_geometry()
     with pytest.raises(ValueError, match="duplicate geometry_id"):
-        generate_candidates(all_pass(400), geometries=[geometry, geometry])
+        fixed(all_pass(400), geometries=[geometry, geometry])
 
 
 def test_non_geometry_entries_are_rejected():
     with pytest.raises(TypeError):
-        generate_candidates(all_pass(400), geometries=[{"lengths": (19,) * 8}])
+        fixed(all_pass(400), geometries=[{"lengths": (19,) * 8}])
 
 
 def test_negative_max_candidates_is_rejected():
     with pytest.raises(ValueError, match="max_candidates"):
-        generate_candidates(all_pass(400), max_candidates=-1)
+        fixed(all_pass(400), max_candidates=-1)
 
 
 def test_count_candidate_slots_ignores_the_screens():
@@ -706,7 +755,7 @@ def test_count_candidate_slots_ignores_the_screens():
         length, DEFAULT_GEOMETRIES, 1
     )
     # a template that passes nothing still has the same number of slots
-    assert len(generate_candidates("AT" * (length // 2))) == 0
+    assert len(fixed("AT" * (length // 2))) == 0
     assert count_candidate_slots(length) > 0
     assert count_candidate_slots(10) == 0
 
@@ -720,8 +769,191 @@ def test_five_kb_template_at_stride_one_is_fast():
     rng = np.random.default_rng(0)
     template = "".join(rng.choice(list("ACGT"), size=5000))
     started = time.perf_counter()
-    candidates = generate_candidates(template, stride=1)
+    candidates = fixed(template, stride=1)
     elapsed = time.perf_counter() - started
     assert 20_000 < len(candidates) <= count_candidate_slots(5000)
-    assert count_candidate_slots(5000) == 24_033
+    assert count_candidate_slots(5000) == 24_036
     assert elapsed < 10.0, f"5 kb stride-1 generation took {elapsed:.2f}s"
+
+
+# ---------------------------------------------------------------------------
+# The sampled default (the design notes' scheme)
+#
+# "for every sampled position, I think we have the compute to sample multiple
+# primersets for that position with different spacings and lengths (i.e. let's
+# say 5). Because the LML dataset had gaps of (5, 0, 0, 5, 0, 0, 5, 0), I think
+# it would be helpful to as a rule have one of those 5 primerset spacings" /
+# "for our 'default' primerset at that position ... I'd nominate our median
+# primerlengths in the LML datasets, which is 19-20."
+# ---------------------------------------------------------------------------
+
+
+def test_the_default_is_canonical_plus_four_sampled():
+    assert DEFAULT_N_SAMPLED == 4
+    candidates = generate_candidates(all_pass(1000), stride=1)
+    ids = Counter(s.geometry_id for s in candidates)
+    assert set(ids) == {
+        CANONICAL_GEOMETRY_ID,
+        "sampled-0",
+        "sampled-1",
+        "sampled-2",
+        "sampled-3",
+    }, "five layouts per position, one of them canonical"
+
+
+def test_the_canonical_layout_is_always_present_at_every_surviving_anchor():
+    """The notes make this a rule, not a tendency."""
+    candidates = generate_candidates(all_pass(800), stride=1)
+    canonical_anchors = {
+        s.anchor for s in candidates if s.geometry_id == CANONICAL_GEOMETRY_ID
+    }
+    expected = set(range(0, 800 - canonical_geometry().span + 1))
+    assert canonical_anchors == expected
+
+
+def test_the_same_input_reproduces_the_same_sets():
+    """Sampling must not cost reproducibility -- the seed comes from the input."""
+    template = all_pass(1200)
+    first = generate_candidates(template, stride=3)
+    second = generate_candidates(template, stride=3)
+    assert [s.set_id for s in first] == [s.set_id for s in second]
+    assert [p.sequence for s in first for p in s.ordered()] == [
+        p.sequence for s in second for p in s.ordered()
+    ]
+
+
+def test_a_different_template_gets_different_layouts():
+    """Otherwise the seed is a constant in disguise."""
+    a = generate_candidates(all_pass(600), stride=1)
+    b = generate_candidates(random_template(600, seed=99), stride=1)
+    layouts_a = {_layout_of(s) for s in a if s.geometry_id.startswith("sampled")}
+    layouts_b = {_layout_of(s) for s in b if s.geometry_id.startswith("sampled")}
+    assert layouts_a != layouts_b
+
+
+def test_an_explicit_seed_overrides_the_derived_one():
+    template = all_pass(600)
+    derived = generate_candidates(template, stride=1)
+    pinned = generate_candidates(template, stride=1, geometry_seed=12345)
+    assert [_layout_of(s) for s in derived] != [_layout_of(s) for s in pinned]
+    again = generate_candidates(template, stride=1, geometry_seed=12345)
+    assert [s.set_id for s in pinned] == [s.set_id for s in again]
+
+
+def test_the_global_numpy_rng_is_never_touched():
+    """The reference implementation's bug: concurrent runs perturbing each other."""
+    np.random.seed(1234)
+    before = np.random.get_state()[1][:8].copy()
+    generate_candidates(all_pass(900), stride=1)
+    after = np.random.get_state()[1][:8]
+    assert np.array_equal(before, after)
+
+
+def test_sampling_explores_far_more_layouts_than_the_fixed_panel():
+    """The whole point: coverage of the design space, not five points in it."""
+    template = all_pass(3000)
+    sampled = generate_candidates(template, stride=1)
+    panel = fixed(template, stride=1)
+    n_sampled_layouts = len({_layout_of(s) for s in sampled})
+    n_panel_layouts = len({_layout_of(s) for s in panel})
+    assert n_panel_layouts == 5
+    assert n_sampled_layouts > 1000, n_sampled_layouts
+    # Comparable candidate counts -- the diversity is free, not bought with
+    # extra inference.
+    assert 0.8 < len(sampled) / len(panel) < 1.25
+
+
+def test_every_sampled_layout_obeys_the_declared_bounds():
+    """Draws are clipped, not rejected, so the bounds are hard."""
+    lo, hi = LENGTH_BOUNDS
+    for primer_set in generate_candidates(all_pass(1500), stride=1):
+        primers = primer_set.ordered()
+        for primer in primers:
+            assert lo <= primer.length <= hi, (primer_set.set_id, primer)
+        gaps = [
+            primers[i + 1].start - primers[i].end for i in range(len(primers) - 1)
+        ]
+        for label, gap, (gap_lo, gap_hi) in zip(GAP_LABELS, gaps, GAP_BOUNDS):
+            assert gap_lo <= gap <= gap_hi, (primer_set.set_id, label, gap)
+
+
+def test_sampled_sets_stay_inside_the_template():
+    """A drawn span is not known until drawn, so bounds are checked after."""
+    length = 400
+    for primer_set in generate_candidates(all_pass(length), stride=1):
+        for primer in primer_set.ordered():
+            assert 0 <= primer.start < primer.end <= length
+
+
+def test_n_sampled_zero_is_purely_deterministic():
+    template = all_pass(700)
+    one = generate_candidates(template, n_sampled=0, geometries=DEFAULT_GEOMETRIES)
+    two = generate_candidates(template, n_sampled=0, geometries=DEFAULT_GEOMETRIES)
+    assert [s.set_id for s in one] == [s.set_id for s in two]
+    assert {s.geometry_id for s in one} == {
+        g.geometry_id for g in DEFAULT_GEOMETRIES
+    }
+
+
+def test_negative_n_sampled_is_an_error():
+    with pytest.raises(ValueError, match="n_sampled"):
+        generate_candidates(all_pass(400), n_sampled=-1)
+
+
+def test_no_fixed_geometries_is_allowed_when_sampling():
+    """Sampled layouts can carry a run on their own."""
+    candidates = generate_candidates(all_pass(700), geometries=[], n_sampled=2)
+    assert candidates
+    assert {s.geometry_id for s in candidates} == {"sampled-0", "sampled-1"}
+
+
+def test_no_geometries_at_all_is_still_an_error():
+    with pytest.raises(ValueError, match="must not be empty"):
+        generate_candidates(all_pass(700), geometries=[], n_sampled=0)
+
+
+def test_max_candidates_thins_sampled_runs_by_whole_anchors():
+    candidates = generate_candidates(all_pass(2000), stride=1, max_candidates=100)
+    assert len(candidates) <= 100
+    per_anchor = Counter(s.anchor for s in candidates)
+    # Every retained anchor keeps its full complement of five layouts, except
+    # possibly the last, which the truncation may cut.
+    full = [n for anchor, n in sorted(per_anchor.items())][:-1]
+    assert full and set(full) == {5}
+
+
+def test_canonical_lengths_are_the_measured_lml_medians():
+    """Recorded so a future edit cannot quietly drift off the data.
+
+    Measured over LMLv1 + LMLv2 (119,928 sets): per-type medians are
+    F3 19, F2 20, FL 20, F1c 20, B1c 19, BL 19, B2 20, B3 20.
+    """
+    assert CANONICAL_LENGTHS == (19, 20, 20, 20, 19, 19, 20, 20)
+    assert dict(zip(PRIMER_TYPE_ORDER, CANONICAL_LENGTHS)) == {
+        "F3": 19, "F2": 20, "FL": 20, "F1c": 20,
+        "B1c": 19, "BL": 19, "B2": 20, "B3": 20,
+    }
+    assert set(CANONICAL_LENGTHS) <= {19, 20}, "the notes say 19-20"
+
+
+def test_normal_draws_centre_on_the_midpoint_and_respect_the_range():
+    rng = np.random.default_rng(0)
+    drawn = _normal_draws(rng, 15, 25, 20_000)
+    assert drawn.min() >= 15 and drawn.max() <= 25
+    assert abs(drawn.mean() - 20.0) < 0.1
+    # ~99.7% within range before clipping means sigma = width / 6.
+    assert 1.5 < drawn.std() < 1.9
+
+
+def test_a_pinned_range_draws_that_constant():
+    """GAP_BOUNDS pins F3-F2 and B2-B3 at 5; sigma 0 must not produce NaN."""
+    rng = np.random.default_rng(0)
+    drawn = _normal_draws(rng, 5, 5, 500)
+    assert set(drawn.tolist()) == {5}
+
+
+def test_derive_geometry_seed_is_stable_and_input_sensitive():
+    assert derive_geometry_seed("ACGT" * 50, 1) == derive_geometry_seed("ACGT" * 50, 1)
+    assert derive_geometry_seed("ACGT" * 50, 1) != derive_geometry_seed("ACGT" * 50, 2)
+    assert derive_geometry_seed("ACGT" * 50, 1) != derive_geometry_seed("ACGA" * 50, 1)
+    assert 0 <= derive_geometry_seed("ACGT" * 50, 1) < 2**63

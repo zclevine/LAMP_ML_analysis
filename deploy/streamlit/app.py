@@ -47,6 +47,7 @@ memory *before* this app sees a byte, so the flag is what protects memory and
 from __future__ import annotations
 
 import time
+from pathlib import Path
 
 import streamlit as st
 
@@ -198,6 +199,49 @@ the top N by score, because the top N by score is usually one design repeated.
 # ---------------------------------------------------------------------------
 
 
+#: Shipped demo inputs, by label. Paths are resolved against the repo root so
+#: this works from a container as well as a checkout.
+DEMO_PANELS: dict[str, tuple[str, str]] = {
+    "Influenza A H5N1, HA segment (10 genomes)": (
+        "examples/H5N1_HA_demo.fasta",
+        "Ten 2025 H5N1 hemagglutinin sequences from NCBI, 1,715-1,751 nt. "
+        "Ragged, so this exercises the MAFFT alignment path. A stride-1 run "
+        "over this panel takes about 80 seconds on one GPU.",
+    ),
+}
+
+
+def _demo_root() -> Path:
+    """Repo root, whether running from a checkout or an installed copy."""
+    return Path(__file__).resolve().parents[2]
+
+
+def _render_demo_choice() -> None:
+    """Load a shipped panel, so a first run needs no file of one's own.
+
+    Exists because the fastest way to lose a new user is to open on an empty
+    file picker: there is nothing to try, and nothing to compare their own
+    results against.
+    """
+    label = st.selectbox("Demo panel", list(DEMO_PANELS), key="demo_choice")
+    relative, blurb = DEMO_PANELS[label]
+    path = _demo_root() / relative
+    st.caption(blurb)
+    if not path.exists():
+        # A packaging failure, not a user error: say which file and stop,
+        # rather than silently offering an empty panel.
+        st.error(f"Demo panel missing from this install: `{relative}`")
+        st.session_state["fasta_text"] = ""
+        return
+    text = path.read_text()
+    st.session_state["fasta_text"] = text
+    st.session_state["fasta_origin"] = relative
+    n_records = text.count(">")
+    st.success(f"Loaded `{relative}` -- {n_records} sequences.")
+    with st.expander("Preview"):
+        st.code("\n".join(text.splitlines()[:6]) + "\n...", language="text")
+
+
 def _decode_upload(uploaded) -> str | None:
     """Bytes from an upload as text, or None with the reason shown."""
     data = uploaded.getvalue()
@@ -231,12 +275,14 @@ def _page_target() -> None:
 
     source = st.radio(
         "Input method",
-        ["Upload a FASTA file", "Paste sequences"],
+        ["Upload a FASTA file", "Paste sequences", "Demo panel"],
         key="target_source",
         horizontal=True,
         label_visibility="collapsed",
     )
-    if source == "Upload a FASTA file":
+    if source == "Demo panel":
+        _render_demo_choice()
+    elif source == "Upload a FASTA file":
         uploaded = st.file_uploader(
             "Target FASTA",
             type=["fa", "fasta", "fna", "fas", "txt"],

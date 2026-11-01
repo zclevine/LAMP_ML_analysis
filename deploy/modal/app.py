@@ -464,7 +464,14 @@ ENGINE_API: dict[str, tuple[str, str]] = {
         "lamp_design.default_geometries",
         "lamp_design.generation.default_geometries",
     ),
-    # count_candidate_slots(template_length, *, geometries, stride) -> int
+    # geometry_plan(n_geometries, *, fixed) -> {"geometries": [...],
+    #                                            "n_sampled": int}
+    "geometry_plan": (
+        "lamp_design.geometry_plan",
+        "lamp_design.generation.geometry_plan",
+    ),
+    # count_candidate_slots(template_length, *, geometries, n_sampled,
+    #                       stride) -> int
     "count_candidate_slots": (
         "lamp_design.count_candidate_slots",
         "lamp_design.generation.count_candidate_slots",
@@ -811,10 +818,13 @@ def _validate_request(request: dict) -> dict:
 
     n_sets = _bounded("n_sets", 20, 1, MAX_N_SETS)
     stride = _bounded("stride", 5, 1, MAX_STRIDE)
-    # n_geometries selects a prefix of generation.DEFAULT_GEOMETRIES, which is
-    # ordered canonical-first -- so any prefix includes the canonical
-    # (5,0,0,5,0,0,5,0) geometry the model is best calibrated on.
-    n_geometries = _bounded("n_geometries", min(4, n_default_geometries), 1, n_default_geometries)
+    # Layouts per position: the canonical (5,0,0,5,0,0,5,0) geometry the model
+    # is best calibrated on, plus n_geometries - 1 sampled per anchor. Capped
+    # at the fixed panel's size because the design notes ask for five per
+    # position ("i.e. let's say 5"), not because of anything in the code.
+    n_geometries = _bounded(
+        "n_geometries", n_default_geometries, 1, n_default_geometries
+    )
     min_separation = _bounded("min_separation", DEFAULT_MIN_SEPARATION_BP, 0, 100000)
 
     n_records, longest = _fasta_shape(fasta)
@@ -1091,7 +1101,7 @@ def _prepare_stage(req: dict, run_dir: Path) -> tuple[Any, list, dict]:
     """
     read_fasta = _engine("read_fasta")
     prepare_panel = _engine("prepare_panel")
-    default_geometries = _engine("default_geometries")
+    geometry_plan = _engine("geometry_plan")
     count_candidate_slots = _engine("count_candidate_slots")
     generate_candidates = _engine("generate_candidates")
 
@@ -1108,15 +1118,20 @@ def _prepare_stage(req: dict, run_dir: Path) -> tuple[Any, list, dict]:
     )
     panel = prepared.panel
 
-    geometries = list(default_geometries())[: req["n_geometries"]]
+    # One knob -- "layouts per position" -- resolved in the engine, so the
+    # Modal side cannot drift from the CLI on what n_geometries means.
+    plan = geometry_plan(req["n_geometries"])
     # Recorded before generation so an empty result can say whether the
     # template was simply too short or the GC/ACGT screen emptied it.
     slots = count_candidate_slots(
-        len(panel.consensus), geometries=geometries, stride=req["stride"]
+        len(panel.consensus),
+        geometries=plan["geometries"],
+        n_sampled=plan["n_sampled"],
+        stride=req["stride"],
     )
     primer_sets = generate_candidates(
         panel.consensus,
-        geometries=geometries,
+        **plan,
         stride=req["stride"],
         max_candidates=MAX_CANDIDATE_SETS,
     )
@@ -1187,13 +1202,15 @@ def _record_params(
     `run_facts` showed device, conditions, geometries and every count as blank,
     and `result.json` from a Modal run was not comparable to one from the CLI.
     """
-    geometries = _engine("default_geometries")()[: req["n_geometries"]]
+    plan = _engine("geometry_plan")(req["n_geometries"])
     result.params.update(
         {
             "stride": req["stride"],
             "geometries": [
-                getattr(g, "geometry_id", None) or str(g) for g in geometries
-            ],
+                getattr(g, "geometry_id", None) or str(g)
+                for g in plan["geometries"]
+            ]
+            + [f"sampled-{i}" for i in range(int(plan["n_sampled"]))],
             "conditions": [str(c) for c in _conditions_from_request(req)],
             "ranking_condition": str(_ranking_condition_from_request(req)),
             "tp_threshold_minutes": req["tp_threshold_minutes"],
