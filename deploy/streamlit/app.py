@@ -1199,7 +1199,7 @@ def _gate_passed() -> bool:
         return True
 
     st.title("LAMP primer design")
-    st.caption("Internal demo. Ask Sameed for the password.")
+    st.caption("Internal demo. Enter the password to continue.")
     with st.form("gate"):
         supplied = st.text_input("Password", type="password")
         submitted = st.form_submit_button("Enter")
