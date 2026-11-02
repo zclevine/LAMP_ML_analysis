@@ -70,10 +70,34 @@ def test_ambiguity_codes_are_rejected_rather_than_cleaned():
     assert "other than A, C, G and T" in check.errors[0]
 
 
-def test_gaps_are_rejected_unless_the_input_is_declared_aligned():
+def test_gaps_are_rejected_even_when_the_input_is_declared_aligned():
+    """`pre_aligned` must not widen what the validator accepts.
+
+    It used to: `allowed = ACGT | GAP_CHARS if pre_aligned else ACGT`, so the
+    UI accepted a gapped panel that `prepare` then refused. The validator's
+    job is to predict the engine, never to be more permissive than it.
+    """
     gapped = ">a\n" + "ACG-" * 100 + "\n>b\n" + "ACGT" * 100 + "\n"
     assert "alignment gaps" in _validation.validate_fasta(gapped).errors[0]
-    assert _validation.validate_fasta(gapped, pre_aligned=True).ok
+
+    declared = _validation.validate_fasta(gapped, pre_aligned=True)
+    assert not declared.ok, "pre_aligned must not let gaps through"
+    assert "alignment gaps" in declared.errors[0]
+
+
+def test_the_target_step_offers_no_already_aligned_checkbox():
+    """The choice no longer exists, so offering it misleads.
+
+    It used to mean "accept gaps and skip MAFFT". Gaps are now refused from
+    every source and the aligner is never run, so a user ticking it would be
+    promised behaviour the engine cannot deliver.
+    """
+    source = (APP_DIR / "app.py").read_text()
+    assert "Input is already aligned" not in source
+    assert 'key="p_pre_aligned"' not in source, "the checkbox widget is still there"
+    assert 'params["pre_aligned"] = False' in source, (
+        "the request field must still be set, just not by a widget"
+    )
 
 
 def test_duplicate_sequence_names_are_rejected():

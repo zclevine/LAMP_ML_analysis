@@ -251,9 +251,11 @@ def weights_status() -> tuple[bool, str]:
 def tool_status() -> dict[str, str | None]:
     """External binaries the engine shells out to, resolved the way it does.
 
-    MAFFT is needed only for a multi-sequence panel whose rows are not already
-    the same length; ``thermo`` prefers the in-process ``RNA`` bindings and only
-    falls back to the ``RNAduplex`` binary, so neither is unconditionally fatal.
+    MAFFT is vestigial -- the engine never aligns now, since input must arrive
+    pre-aligned and gapless -- but it is still reported so a stale image shows
+    up here rather than confusing someone later. ``thermo`` prefers the
+    in-process ``RNA`` bindings and only falls back to the ``RNAduplex``
+    binary, so neither is unconditionally fatal.
     The Run page's preflight decides which of these matters for a given input.
     """
     status: dict[str, str | None] = {

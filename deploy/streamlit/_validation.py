@@ -81,8 +81,9 @@ class FastaCheck:
     def ragged(self) -> bool:
         """Whether a multi-sequence panel would need an aligner.
 
-        prepare treats equal-length ungapped rows as already aligned and skips
-        MAFFT; ragged input is what makes MAFFT mandatory.
+        prepare treats equal-length ungapped rows as the alignment; ragged
+        input is refused outright rather than aligned, because aligning would
+        introduce the gap columns the engine does not support.
         """
         return self.n_seqs > 1 and self.min_len != self.max_len
 
@@ -119,7 +120,11 @@ def parse_fasta(text: str) -> list[tuple[str, str]]:
 def validate_fasta(text: str, *, pre_aligned: bool = False, source: str = "input") -> FastaCheck:
     """Reject malformed, oversized or unusable target input before any work."""
     check = FastaCheck()
-    allowed = ACGT | GAP_CHARS if pre_aligned else ACGT
+    # Gaps are never allowed, whatever `pre_aligned` says. The parameter used
+    # to widen this to ACGT | GAP_CHARS, which let the UI accept input the
+    # engine then refused -- the validator's job is to predict the engine, not
+    # to be more permissive than it.
+    allowed = ACGT
 
     n_bytes = len(text.encode("utf-8"))
     if n_bytes == 0:
@@ -163,10 +168,12 @@ def validate_fasta(text: str, *, pre_aligned: bool = False, source: str = "input
         bad = sorted(set(seq) - allowed)
         if bad:
             shown = " ".join(repr(c) for c in bad[:6]) + (" ..." if len(bad) > 6 else "")
-            if set(bad) & GAP_CHARS and not pre_aligned:
+            if set(bad) & GAP_CHARS:
                 check.errors.append(
-                    f"'{label}' contains alignment gaps ({shown}). Tick "
-                    "'input is already aligned' if you are supplying an alignment."
+                    f"'{label}' contains alignment gaps ({shown}). Gapped "
+                    "alignments are not supported: trim the panel to a "
+                    "contiguous block of columns where every sequence has a "
+                    "base, and upload that."
                 )
             else:
                 check.errors.append(

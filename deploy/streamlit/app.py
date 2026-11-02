@@ -206,9 +206,10 @@ the top N by score, because the top N by score is usually one design repeated.
 DEMO_PANELS: dict[str, tuple[str, str]] = {
     "Influenza A H5N1, HA segment (10 genomes)": (
         "examples/H5N1_HA_demo.fasta",
-        "Ten 2025 H5N1 hemagglutinin sequences from NCBI, 1,715-1,751 nt. "
-        "Ragged, so this exercises the MAFFT alignment path. A stride-1 run "
-        "over this panel takes about 80 seconds on one GPU.",
+        "Ten 2025 H5N1 hemagglutinin sequences from NCBI, aligned and trimmed "
+        "to the largest gapless block: 10 x 1,715 nt, no gaps, A/C/G/T only. "
+        "A worked example of the input shape the engine requires. A stride-1 "
+        "run over this panel takes about 40 seconds on one GPU.",
     ),
 }
 
@@ -277,14 +278,14 @@ def _page_target() -> None:
 
     source = st.radio(
         "Input method",
-        ["Upload a FASTA file", "Paste sequences", "Demo panel"],
+        ["Upload an aligned, gapless FASTA file", "Paste sequences", "Demo panel"],
         key="target_source",
         horizontal=True,
         label_visibility="collapsed",
     )
     if source == "Demo panel":
         _render_demo_choice()
-    elif source == "Upload a FASTA file":
+    elif source == "Upload an aligned, gapless FASTA file":
         uploaded = st.file_uploader(
             "Target FASTA",
             type=["fa", "fasta", "fna", "fas", "txt"],
@@ -321,15 +322,15 @@ def _page_target() -> None:
         st.session_state["fasta_origin"] = "pasted"
 
     params = _layout.init_params()
-    params["pre_aligned"] = st.checkbox(
-        "Input is already aligned",
-        value=bool(params["pre_aligned"]),
-        key="p_pre_aligned",
-        help=(
-            "Accept gap characters and use the rows as the alignment instead of running "
-            "MAFFT. Required when the sequences differ in length and MAFFT is not "
-            "installed."
-        ),
+    # There is deliberately no "input is already aligned" checkbox. It used to
+    # mean "accept gap characters and skip MAFFT", and both halves stopped
+    # being true when gapless input became the rule: gaps are now refused from
+    # every source and the aligner is never run. Offering the choice implied
+    # the engine could do something it cannot.
+    params["pre_aligned"] = False
+    st.caption(
+        "Sequences must be pre-aligned, the same length, and free of gaps "
+        "(`-`) and ambiguity codes."
     )
 
     check = _layout.target_check()
@@ -344,16 +345,19 @@ def _page_target() -> None:
             columns[1].metric("Longest", f"{check.max_len:,} nt")
             columns[2].metric("Total", f"{check.total_bases:,} nt")
             columns[3].metric("Budget", f"{check.budget:,}")
-            if check.ragged and not params["pre_aligned"]:
-                st.info(
-                    f"The sequences differ in length ({check.min_len:,}-{check.max_len:,} "
-                    "nt), so MAFFT will be run to align them before a consensus is "
-                    "derived."
+            if check.ragged:
+                st.error(
+                    f"The sequences differ in length ({check.min_len:,}-"
+                    f"{check.max_len:,} nt), so they are not an alignment. Align "
+                    "them and trim to a gapless block before uploading. "
+                    "lamp-design will not align them for you: aligning creates "
+                    "gap columns, and a primer cannot sit over a column most of "
+                    "the panel does not cover."
                 )
-            elif check.n_seqs > 1 and not params["pre_aligned"]:
+            elif check.n_seqs > 1:
                 st.info(
-                    f"All {check.n_seqs} sequences are {check.max_len:,} nt with no gaps, "
-                    "so the engine treats them as already aligned and does not run MAFFT."
+                    f"All {check.n_seqs} sequences are {check.max_len:,} nt with no "
+                    "gaps, so they are used as the alignment."
                 )
 
     st.divider()

@@ -434,14 +434,17 @@ def preflight_checks() -> tuple[list[str], list[str]]:
             "no meaning."
         )
 
-    if check is not None and check.ok and check.ragged and not params["pre_aligned"]:
-        if not tools["mafft"]:
-            blockers.append(
-                f"MAFFT is not on PATH and the {check.n_seqs} input sequences differ in "
-                f"length ({check.min_len:,}-{check.max_len:,} nt), so a consensus cannot "
-                "be derived. Install MAFFT, align the sequences yourself and tick "
-                "'input is already aligned', or submit one sequence."
-            )
+    # Ragged input is refused outright, whether or not MAFFT is installed:
+    # aligning here would introduce gap columns, and gapped panels are not
+    # supported. This used to offer "install MAFFT or tick 'already aligned'",
+    # neither of which does anything now.
+    if check is not None and check.ok and check.ragged:
+        blockers.append(
+            f"The {check.n_seqs} input sequences differ in length "
+            f"({check.min_len:,}-{check.max_len:,} nt), so they are not an "
+            "alignment. Align them and trim to a gapless block, or submit one "
+            "sequence."
+        )
 
     if not tools["RNA bindings"] and not tools["RNAduplex"]:
         blockers.append(
