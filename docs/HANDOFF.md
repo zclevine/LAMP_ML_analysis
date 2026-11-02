@@ -40,6 +40,30 @@ Ask Sameed. Point `LAMP_DESIGN_WEIGHTS` at the directory that contains the
 > run directory. `docker cp`, `modal volume put` and `tar` will all happily copy
 > the links instead of the data. Dereference first: `cp -rL`.
 
+## Hosted internal demo
+
+The portal is deployed on Modal, serving the UI from the same workspace that
+holds the weights — so there is no new service, no new credential, and nothing
+for the weights to be copied into:
+
+```bash
+modal deploy deploy/modal/portal.py          # proxy auth (scripts, your own use)
+```
+
+For a link teammates can open in a browser, Modal's proxy auth will not work
+(it is header-based), so use a public URL with the app's password gate:
+
+```bash
+modal secret create lamp-design-portal-auth \
+    LAMP_DESIGN_PORTAL_PASSWORD="$(openssl rand -base64 12)"
+
+LAMP_DESIGN_PORTAL_PUBLIC=1 modal deploy deploy/modal/portal.py
+```
+
+Deploying public without the gate is refused at import time. `min_containers=1`
+keeps one instance warm, which is why this does not have Cloud Run's cold-start
+problem.
+
 ## Try it in two minutes
 
 ```bash

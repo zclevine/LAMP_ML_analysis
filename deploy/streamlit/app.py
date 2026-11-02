@@ -46,6 +46,8 @@ memory *before* this app sees a byte, so the flag is what protects memory and
 
 from __future__ import annotations
 
+import hmac
+import os
 import time
 from pathlib import Path
 
@@ -1142,7 +1144,50 @@ _PAGES = {
 }
 
 
+def _gate_passed() -> bool:
+    """Shared-password gate, active only when a password is configured.
+
+    Exists for one specific situation: a hosted internal demo. Modal's own
+    proxy auth is header-based (`Modal-Key` / `Modal-Secret`), which a browser
+    cannot supply from a clicked link, so a link teammates can actually open
+    has to be a public URL -- and the model weights are deliberately out of
+    git while the patent application is pending, so a public URL with no gate
+    is not acceptable.
+
+    Deliberately modest about what this is: a shared password in front of a
+    demo, not authentication. It does not identify anyone, there is one
+    credential for everybody, and it is only as private as the people who know
+    it. Fine for "my team can try this", not a control to put real secrets
+    behind.
+
+    Unset `LAMP_DESIGN_PORTAL_PASSWORD` and the gate disappears entirely, so
+    local runs and the Docker images are unaffected.
+    """
+    expected = os.environ.get("LAMP_DESIGN_PORTAL_PASSWORD", "")
+    if not expected:
+        return True
+    if st.session_state.get("_gate_ok"):
+        return True
+
+    st.title("LAMP primer design")
+    st.caption("Internal demo. Ask Sameed for the password.")
+    with st.form("gate"):
+        supplied = st.text_input("Password", type="password")
+        submitted = st.form_submit_button("Enter")
+    if submitted:
+        # compare_digest, not ==, so a wrong password cannot be narrowed down
+        # by timing one character at a time.
+        if hmac.compare_digest(supplied, expected):
+            st.session_state["_gate_ok"] = True
+            st.rerun()
+        else:
+            st.error("Incorrect password.")
+    return False
+
+
 def main() -> None:
+    if not _gate_passed():
+        return
     _layout.render_sidebar()
     if error := st.session_state.pop("run_error", None):
         st.error(error)

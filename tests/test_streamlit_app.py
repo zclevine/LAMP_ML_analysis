@@ -901,3 +901,51 @@ def test_every_portal_image_honours_the_cloud_run_port_contract():
         assert "${PORT:-8080}" in text, f"{name} ignores $PORT"
         assert "--server.address=0.0.0.0" in text, f"{name} does not bind 0.0.0.0"
         assert "STREAMLIT_SERVER_HEADLESS=true" in text, f"{name} is not headless"
+
+
+# ---------------------------------------------------------------------------
+# The demo password gate
+#
+# Only active when LAMP_DESIGN_PORTAL_PASSWORD is set, so local runs and the
+# Docker images are unaffected. It is a shared password in front of a demo,
+# not authentication -- but it must at least be a correct shared password.
+# ---------------------------------------------------------------------------
+
+
+def test_the_gate_is_absent_unless_a_password_is_configured(monkeypatch):
+    monkeypatch.delenv("LAMP_DESIGN_PORTAL_PASSWORD", raising=False)
+    assert _portal()._gate_passed() is True
+
+
+def test_an_empty_password_does_not_enable_the_gate(monkeypatch):
+    """A secret that failed to populate must not lock everyone out."""
+    monkeypatch.setenv("LAMP_DESIGN_PORTAL_PASSWORD", "")
+    assert _portal()._gate_passed() is True
+
+
+def test_the_gate_uses_a_constant_time_comparison():
+    """A plain == lets a wrong password be narrowed one character at a time."""
+    source = (APP_DIR / "app.py").read_text()
+    body = source[source.index("def _gate_passed"): source.index("def main()")]
+    assert "compare_digest" in body
+    assert "== expected" not in body and "expected ==" not in body
+
+
+def test_the_gate_runs_before_anything_else():
+    """A gate rendered after the page has already been built is not a gate."""
+    source = (APP_DIR / "app.py").read_text()
+    main = source[source.index("def main()"):]
+    assert main.index("_gate_passed()") < main.index("render_sidebar")
+
+
+def test_the_hosted_portal_requires_a_gate_or_proxy_auth():
+    """A public URL with neither would expose the demo to the internet.
+
+    The weights stay out of git while the patent is pending; the hosted portal
+    must not be the thing that undoes that.
+    """
+    source = (APP_DIR.parents[1] / "deploy" / "modal" / "portal.py").read_text()
+    assert "requires_proxy_auth" in source
+    assert "LAMP_DESIGN_PORTAL_PASSWORD" in source, (
+        "going public must come with the password gate"
+    )

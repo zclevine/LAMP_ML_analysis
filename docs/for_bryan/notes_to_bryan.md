@@ -92,3 +92,13 @@ Drafts in Sameed's voice — edit freely before sending.
 > elsewhere. Dropping it takes the image from 3.4 GB to a fraction of that,
 > which attacks the cold start at the source instead of paying to paper over
 > it. If you end up hosting the thin-client version you'd get that for free.
+
+
+---
+
+## (D) Internal demo link, for teammates
+
+> If you want to poke at it before any of this is decided — it's deployed on
+> Modal and I can send you a link plus a password. Takes nothing to stand up
+> on our side and the weights never leave our workspace, so it's the easiest
+> way to look at the actual thing rather than screenshots.
