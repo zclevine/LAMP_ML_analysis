@@ -62,9 +62,28 @@ COLD START
 ----------
 ``min_containers=1`` keeps one instance warm, which is the same fix as Cloud
 Run's ``min_instances = 1`` and the reason this does not take 20 seconds to
-load. It bills a CPU container continuously -- cheap, since there is no GPU
-attached here, but not nothing. Set it to 0 for a demo you use once, and
-accept a slow first hit.
+load.
+
+**It is not cheap, and an earlier version of this comment said it was.** At
+``cpu=1.0`` and ``memory=2048`` the rates (verified at modal.com/pricing,
+2026-11-02: $0.0000131 per core-second, $0.00000222 per GiB-second) come to:
+
+====================  ==========
+per hour              $0.063
+per day               $1.52
+per 30 days           $45.46
+====================  ==========
+
+which **exhausts the Starter plan's $30 monthly credit in about 20 days of
+sitting idle**, before a single design is run. For comparison a full design
+run is 84 L40S GPU-seconds, about $0.046 -- so a day of idle UI costs what 33
+design runs cost. Nobody is doing 33 runs a day, which means the warm
+container, not the GPU, is the whole bill.
+
+Set ``LAMP_DESIGN_PORTAL_WARM=0`` to drop the baseline to roughly nothing and
+pay a cold start on the first visit after idle instead. For a demo that gets
+opened a handful of times that is the better trade, and Modal's cold starts
+are nothing like Cloud Run's -- this image has no torch in it.
 
 The GPU is only attached to the *design* function, which is a separate
 container that exists for the seconds a run takes.
@@ -99,6 +118,9 @@ LOCAL_REPO = (
 #: `lamp_design` itself IS installed, because the UI uses it for input
 #: validation, the geometry count and report rendering -- its model imports are
 #: function-local, so it imports fine with no torch present.
+_PUBLIC_FLAG = "1" if os.environ.get("LAMP_DESIGN_PORTAL_PUBLIC") == "1" else "0"
+_GATE_FLAG = "1" if os.environ.get("LAMP_DESIGN_PORTAL_GATE") == "1" else "0"
+
 portal_image = (
     modal.Image.debian_slim(python_version="3.10")
     .pip_install(
@@ -132,6 +154,11 @@ portal_image = (
             # a byte, so this cap protects memory, not just work.
             "STREAMLIT_SERVER_MAX_UPLOAD_SIZE": "5",
             "PYTHONUNBUFFERED": "1",
+            # The deploy-time flags, carried into the container so that the
+            # module's Modal object graph is identical in both places. See
+            # the comment on _PUBLIC_FLAG below for what breaks without this.
+            "LAMP_DESIGN_PORTAL_PUBLIC": _PUBLIC_FLAG,
+            "LAMP_DESIGN_PORTAL_GATE": _GATE_FLAG,
         }
     )
 )
@@ -149,8 +176,28 @@ PORTAL_SECRET_NAME = os.environ.get(
     "LAMP_DESIGN_PORTAL_SECRET", "lamp-design-portal-auth"
 )
 
-PORTAL_PUBLIC = os.environ.get("LAMP_DESIGN_PORTAL_PUBLIC") == "1"
-USE_PASSWORD = PORTAL_PUBLIC or os.environ.get("LAMP_DESIGN_PORTAL_GATE") == "1"
+#: Deploy-time intent, resolved once and then baked into the image below.
+#:
+#: This indirection is load-bearing. These flags are set on the *deploy
+#: command* (`LAMP_DESIGN_PORTAL_PUBLIC=1 modal deploy ...`), so they exist in
+#: the local shell and not in the container. Modal re-imports this module
+#: inside the container to find the function, so anything derived from them
+#: evaluates differently in the two places -- and the secret list is derived
+#: from them. Locally the function declared image + secret; remotely it
+#: declared image alone, and Modal rejected the mismatch:
+#:
+#:   ExecutionError: Function has 1 dependencies but container got 2 object ids
+#:   Code deps: [Image(...)]
+#:   Object ids: ['st-...', 'im-...']
+#:
+#: Every new container crash-looped on startup while the *previous*
+#: deployment's container kept serving, so the deploy looked successful, the
+#: URL answered 200, and the old code answered it -- no password prompt and a
+#: pre-bundling weights error. Putting the flags in the image's env makes the
+#: container see the same values the deploy did, so the dependency list is
+#: identical in both places by construction.
+PORTAL_PUBLIC = _PUBLIC_FLAG == "1"
+USE_PASSWORD = PORTAL_PUBLIC or _GATE_FLAG == "1"
 
 # A public URL with no gate would put GPU spend behind an unauthenticated
 # endpoint. Refuse at deploy time rather than discover it on a bill.

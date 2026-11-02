@@ -995,3 +995,43 @@ def test_an_empty_portal_password_fails_closed_not_open():
     assert empty_branch < session_shortcut, (
         "the empty-password check must come before the session-state bypass"
     )
+
+
+def test_portal_deploy_flags_are_baked_into_the_image():
+    """A conditional Modal object must not depend on the deploy shell's env.
+
+    LAMP_DESIGN_PORTAL_PUBLIC is set on the deploy *command*, so it exists in
+    the local shell and not in the container. Modal re-imports portal.py
+    inside the container to find the function, so anything derived from that
+    variable evaluates differently in the two places -- and PORTAL_SECRETS is
+    derived from it. Locally the function declared image + secret; remotely it
+    declared image alone, and Modal refused:
+
+        ExecutionError: Function has 1 dependencies but container got 2 object
+        ids.  Object ids: ['st-...', 'im-...']
+
+    The failure is nasty because it is invisible from outside: every new
+    container crash-looped on startup while the *previous* deployment's
+    container kept serving, so `modal deploy` reported success, the URL
+    answered 200, and stale code answered it -- no password prompt and a
+    pre-weights-bundling error message. Observed 2026-11-02.
+
+    Baking the flags into the image's env makes the container see what the
+    deploy saw, so the object graph is identical in both places.
+    """
+    portal = (APP_DIR.parents[1] / "deploy" / "modal" / "portal.py").read_text()
+
+    assert '"LAMP_DESIGN_PORTAL_PUBLIC": _PUBLIC_FLAG' in portal, (
+        "the public flag must be carried into the container via the image env"
+    )
+    assert '"LAMP_DESIGN_PORTAL_GATE": _GATE_FLAG' in portal, (
+        "the gate flag must be carried into the container via the image env"
+    )
+    # Derived values must come from the normalised flags, not from os.environ
+    # directly, or the indirection buys nothing.
+    assert "PORTAL_PUBLIC = _PUBLIC_FLAG ==" in portal
+    assert "USE_PASSWORD = PORTAL_PUBLIC or _GATE_FLAG ==" in portal
+    # And the flags must be computed before the image that carries them.
+    assert portal.index("_PUBLIC_FLAG =") < portal.index("portal_image = "), (
+        "the image definition needs the flags, so they must precede it"
+    )
