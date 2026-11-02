@@ -14,19 +14,14 @@ import streamlit as st
 import _backend
 from _tables import (
     INCLUSIVITY_FIELD,
-    SPEED_FIELD,
-    conditions_frame,
     evaluate_matrix,
     evaluate_metrics_frame,
     is_evaluate,
     predictions_frame,
     funnel_culprit,
-    funnel_frame,
     primers_frame,
-    run_facts,
     sets_frame,
     target_matrix,
-    timings_frame,
 )
 
 
@@ -41,75 +36,20 @@ def _download(label: str, frame: pd.DataFrame, filename: str, key: str) -> None:
     )
 
 
-def render_funnel(result: dict, *, emphasise: bool) -> None:
-    """Explain which stage emptied the result, instead of an empty table.
-
-    Every stage records its surviving-candidate count into
-    ``DesignResult.funnel`` precisely so that "no candidates" can name the
-    filter that did it. The first stage whose count is zero is the answer.
-    """
-    frame = funnel_frame(result)
-    if frame.empty:
-        if emphasise:
-            st.error(
-                "No candidate sets were returned, and the run reported no funnel, so "
-                "the stage that emptied it cannot be identified. Every stage is "
-                "supposed to record its surviving-candidate count in DesignResult.funnel."
-            )
-        return
-
-    if not emphasise:
-        with st.expander(f"Candidate funnel ({len(frame)} stages)"):
-            st.dataframe(frame, hide_index=True)
-        return
-
-    culprit = funnel_culprit(result)
-    if culprit:
-        st.error(
-            f"**No candidate sets survived.** The funnel empties at **{culprit}** — "
-            "that is the stage to loosen."
-        )
-    else:
-        st.error(
-            "**No candidate sets were returned**, although no funnel stage reports "
-            "zero. Check the warnings below."
-        )
-    st.dataframe(frame, hide_index=True)
-
-
-def render_run_facts(envelope: dict) -> None:
-    """What the run did, from ``DesignResult.params``, plus per-stage timings."""
-    facts = run_facts(envelope)
-    with st.expander("What this run did"):
-        columns = st.columns(4)
-        columns[0].metric("Candidate sets", f"{facts['n_candidates'] or 0:,}")
-        columns[1].metric("(set, target) pairs", f"{facts['n_pairs'] or 0:,}")
-        columns[2].metric("Predictions", f"{facts['n_predictions'] or 0:,}")
-        columns[3].metric("Device", str(facts["device"] or "—"))
-
-        if facts["predictions_per_second"]:
-            st.caption(
-                f"{facts['predictions_per_second']:,.0f} predictions/s during inference "
-                f"at batch size {facts['batch_size']}. One prediction is a "
-                "(set, target, condition) triple through all five seeds."
-            )
-        st.markdown(
-            f"**Stride** {facts['stride']} nt  \n"
-            f"**Geometries** {', '.join(facts['geometries'] or [])}  \n"
-            f"**Conditions** {', '.join(facts['conditions'] or [])}  \n"
-            f"**Ranked under** {facts['ranking_condition']}"
-        )
-        timings = timings_frame(envelope)
-        if not timings.empty:
-            st.dataframe(
-                timings,
-                hide_index=True,
-                column_config={
-                    "share": st.column_config.ProgressColumn(
-                        "share of run", min_value=0.0, max_value=1.0, format="%.0f%%"
-                    )
-                },
-            )
+# render_funnel and render_run_facts are gone deliberately.
+#
+# The candidate funnel was a stage-by-stage survivor table, and "What this run
+# did" reported candidate counts, (set, target) pairs, predictions/s, batch
+# size, the resolved device, the stride and the geometry ids. All of it is
+# instrumentation: it answers "is the pipeline behaving" -- my question while
+# building it -- and not "which primers should I order", which is the user's.
+# A device of `cuda` and a geometry id are not actionable, and showing them
+# invited the reasonable question of why they were on screen at all.
+#
+# The diagnostics still exist in the result envelope and in the CLI's
+# .summary.txt and .json, so nothing is lost for debugging; `funnel_culprit`
+# is still used above to name the stage when a run returns nothing, which is
+# the one moment that information helps whoever is looking at it.
 
 
 def render_envelope(envelope: dict) -> None:
@@ -133,8 +73,10 @@ def render_envelope(envelope: dict) -> None:
             )
 
     if not result.get("sets"):
-        render_funnel(result, emphasise=True)
-        render_run_facts(envelope)
+        st.error("**No candidate primer sets survived.**")
+        culprit = funnel_culprit(result)
+        if culprit:
+            st.caption(f"The last stage to retain anything was **{culprit}**.")
         return
 
     timing = envelope.get("timing_seconds") or {}
@@ -143,57 +85,38 @@ def render_envelope(envelope: dict) -> None:
     columns = st.columns(4)
     columns[0].metric("Sets returned", result["n_sets_returned"])
     columns[1].metric("Targets scored", result["panel"]["n_targets"])
-    columns[2].metric("Best mean Tp", f"{best[SPEED_FIELD]:.1f} min")
+    columns[2].metric("Best set coverage", f"{best[INCLUSIVITY_FIELD]:.0%}")
     columns[3].metric("Runtime", f"{total:.0f} s")
     st.caption(
-        f"Best set `{best['set_id']}` covers {best[INCLUSIVITY_FIELD]:.0%} of the panel "
-        f"under {threshold:g} minutes. Lower Tp is faster; higher inclusivity is better."
+        f"Ranked best first. Rank 1 is `{best['set_id']}`, predicted to amplify "
+        f"{best[INCLUSIVITY_FIELD]:.0%} of your sequences."
     )
 
-    render_funnel(result, emphasise=False)
-    render_run_facts(envelope)
-
     sets = sets_frame(result)
-    tp = target_matrix(result, "predicted_tp_minutes")
     mismatches = target_matrix(result, "primer_target_mismatches")
     primers = primers_frame(result)
-    conditions = conditions_frame(result)
 
-    tab_labels = ["Ranked sets", "Tp by target", "Mismatches", "Primers"]
-    if not conditions.empty and len(conditions.columns) > 3:
-        tab_labels.append("Conditions")
-    tabs = st.tabs(tab_labels)
+    tabs = st.tabs(["Ranked sets", "Mismatches", "Primers"])
 
     with tabs[0]:
         st.caption(
-            "Spread across loci rather than ranked purely by score, so the list is not "
-            "one design repeated. `mean_tp_min` is predicted minutes to amplification — "
-            "**lower is faster**. `inclusivity` is the fraction of targets predicted to "
-            f"amplify in under {threshold:g} minutes."
+            "Spread across the target rather than ranked purely by score, so the "
+            "list is not one design repeated. `inclusivity` is the fraction of "
+            "your sequences the set is predicted to amplify."
         )
         st.dataframe(sets, hide_index=True)
     with tabs[1]:
-        st.caption("Every returned set scored against every input sequence. Lower is faster.")
-        st.dataframe(tp, hide_index=True)
-    with tabs[2]:
         st.caption(
             "Primer-target mismatches, summed over the eight primers, per target. The "
             "model takes these as an input rather than filtering on them."
         )
         st.dataframe(mismatches, hide_index=True)
-    with tabs[3]:
+    with tabs[2]:
         st.caption(
             "One row per primer. Strand `-` means the sequence is the reverse complement "
             "of its target window, per the frozen convention."
         )
         st.dataframe(primers, hide_index=True)
-    if len(tabs) > 4:
-        with tabs[4]:
-            st.caption(
-                "Mean predicted Tp per set under each scored condition. The ranking uses "
-                "one condition; this is how a set degrades across the sweep."
-            )
-            st.dataframe(conditions, hide_index=True)
 
     st.subheader("Downloads")
     columns = st.columns(4)
@@ -321,9 +244,6 @@ def render_evaluate(envelope: dict) -> None:
         with tabs[1]:
             st.caption("Mean predicted Tp per set against each target sequence.")
             st.dataframe(matrix, hide_index=True)
-
-    with st.expander("What this run did"):
-        st.json(result.get("params") or {}, expanded=True)
 
     st.subheader("Downloads")
     columns = st.columns(2)

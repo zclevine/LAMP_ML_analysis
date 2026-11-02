@@ -22,17 +22,25 @@ def sets_frame(result: dict) -> pd.DataFrame:
     """One row per returned set: rank, placement, scores, the eight primers."""
     rows = []
     for entry in result["sets"]:
+        # No Tp columns, and no geometry id.
+        #
+        # Tp: the model's output is used to ORDER the sets and is not shown as a
+        # number. It can be negative (training floors the label at -100 and the
+        # measured labels reach -4.6), the model does not resolve differences
+        # inside the fastest quartile, and a displayed minute figure invites
+        # comparisons it cannot support. The rank is the result.
+        #
+        # Geometry: the id names an internal spacing/length layout -- since
+        # cbfd454 most are drawn from a distribution, so the id is an index into
+        # nothing a user can act on. The primer sequences and the span are the
+        # information; the layout that produced them is not.
         row: dict[str, Any] = {
             "rank": entry["rank"],
             "set_id": entry["set_id"],
             "anchor": entry["anchor"],
-            "geometry": entry["geometry_id"],
             "span_start": entry["span_start"],
             "span_end": entry["span_end"],
-            "mean_tp_min": entry[SPEED_FIELD],
             "inclusivity": entry[INCLUSIVITY_FIELD],
-            "slowest_target": entry.get("slowest_target_name"),
-            "slowest_tp_min": entry.get("slowest_predicted_tp_minutes"),
             "total_mismatches": entry.get("total_primer_target_mismatches_all_targets"),
         }
         for primer in entry["primers"]:

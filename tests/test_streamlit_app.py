@@ -504,7 +504,21 @@ def design_payload() -> dict:
 def test_the_ranked_sets_table_carries_the_eight_primers_as_columns():
     frame = _tables.sets_frame(design_payload())
     assert list(frame.columns)[-8:] == list(PRIMER_TYPES)
-    assert frame.loc[0, "mean_tp_min"] == 5.0
+    assert frame.loc[0, "rank"] == 1
+
+
+def test_the_ranked_sets_table_shows_no_tp_and_no_geometry():
+    """The rank is the result; the Tp behind it is not shown, nor the layout id.
+
+    Tp can be negative, the model does not resolve differences inside the
+    fastest quartile, and a minute figure invites comparisons it cannot
+    support. The geometry id names an internal spacing/length layout that is
+    mostly drawn from a distribution, so it indexes nothing a user can act on.
+    """
+    columns = list(_tables.sets_frame(design_payload()).columns)
+    for banned in ("mean_tp_min", "slowest_tp_min", "slowest_target", "geometry"):
+        assert banned not in columns, f"{banned} is back in the ranked-sets table"
+    assert "rank" in columns and "inclusivity" in columns
 
 
 def test_the_target_matrices_are_keyed_by_the_panels_target_names():
