@@ -37,9 +37,16 @@ your own use, and **not usable for teammates opening a link**.
 **For a shareable demo: a public URL plus the app's password gate.**
 
     modal secret create lamp-design-portal-auth \
-        LAMP_DESIGN_PORTAL_PASSWORD="$(openssl rand -base64 12)"
+        LAMP_DESIGN_PORTAL_PASSWORD=<pick-one> --force
 
     LAMP_DESIGN_PORTAL_PUBLIC=1 modal deploy deploy/modal/portal.py
+
+Set the password literally, in one command. Generating it into a shell
+variable first invites creating the secret with "" in a shell where the
+generate step never ran, and Modal will not read a secret's value back to you
+afterwards, so a generated password you did not capture is simply lost. (The
+app's gate refuses an empty password rather than ignoring it -- see
+`_gate_passed` -- but not relying on that is better.)
 
 Then share the URL and the password. The gate lives in ``_gate_passed`` in
 deploy/streamlit/app.py and is honest about what it is: one shared password in

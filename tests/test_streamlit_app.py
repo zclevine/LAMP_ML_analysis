@@ -917,9 +917,23 @@ def test_the_gate_is_absent_unless_a_password_is_configured(monkeypatch):
     assert _portal()._gate_passed() is True
 
 
-def test_an_empty_password_does_not_enable_the_gate(monkeypatch):
-    """A secret that failed to populate must not lock everyone out."""
+def test_an_empty_password_locks_everyone_out_rather_than_letting_them_in(monkeypatch):
+    """A secret that failed to populate must fail closed.
+
+    This test asserted the opposite until 2026-11-02, on the reasoning that a
+    broken secret should not lock the team out of their own demo. That was
+    wrong, because the same condition is reachable on a *public* URL: create
+    the secret in a shell where $PW was never set and it holds "". Disabling
+    the gate there means publishing an ungated portal. Locking the team out
+    costs one command to fix; publishing cannot be undone.
+    """
     monkeypatch.setenv("LAMP_DESIGN_PORTAL_PASSWORD", "")
+    assert _portal()._gate_passed() is False
+
+
+def test_an_unset_password_still_disables_the_gate(monkeypatch):
+    """Local runs and both Docker images must be unaffected by the gate."""
+    monkeypatch.delenv("LAMP_DESIGN_PORTAL_PASSWORD", raising=False)
     assert _portal()._gate_passed() is True
 
 
@@ -948,4 +962,36 @@ def test_the_hosted_portal_requires_a_gate_or_proxy_auth():
     assert "requires_proxy_auth" in source
     assert "LAMP_DESIGN_PORTAL_PASSWORD" in source, (
         "going public must come with the password gate"
+    )
+
+
+def test_an_empty_portal_password_fails_closed_not_open():
+    """An empty configured password must lock everyone out, not let them in.
+
+    The reachable path: the documented setup generates the password in one
+    shell command and creates the secret in the next. Run the second without
+    the first and the secret holds "". Treating that as "no gate configured"
+    would publish an ungated portal, and portal.py's deploy-time check does
+    not catch it -- that only inspects LAMP_DESIGN_PORTAL_NO_GATE.
+    """
+    source = (APP_DIR / "app.py").read_text()
+    gate = source[source.index("def _gate_passed"):source.index("def main()")]
+
+    assert 'os.environ.get("LAMP_DESIGN_PORTAL_PASSWORD")' in gate, (
+        "the gate must distinguish an unset password from an empty one, so it "
+        "cannot use a '' default"
+    )
+    assert 'get("LAMP_DESIGN_PORTAL_PASSWORD", "")' not in gate, (
+        "a '' default collapses unset and empty into the same case, which is "
+        "what made this fail open"
+    )
+    assert "configured is None" in gate, "unset must be the only gate-off case"
+    assert "if not configured.strip():" in gate, "empty must be handled explicitly"
+
+    # The empty branch must return False before any session-state shortcut can
+    # let a previously-authenticated session through.
+    empty_branch = gate.index("if not configured.strip():")
+    session_shortcut = gate.index('st.session_state.get("_gate_ok")')
+    assert empty_branch < session_shortcut, (
+        "the empty-password check must come before the session-state bypass"
     )

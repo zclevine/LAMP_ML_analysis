@@ -62,11 +62,19 @@ For a link teammates can open in a browser, Modal's proxy auth will not work
 (it is header-based), so use a public URL with the app's password gate:
 
 ```bash
-modal secret create lamp-design-portal-auth \
-    LAMP_DESIGN_PORTAL_PASSWORD="$(openssl rand -base64 12)"
+cd ~/lamp-design    # the venv and the files to upload are both here
 
-LAMP_DESIGN_PORTAL_PUBLIC=1 modal deploy deploy/modal/portal.py
+.venv/bin/modal secret create lamp-design-portal-auth \
+    LAMP_DESIGN_PORTAL_PASSWORD=<pick-one> --force
+
+LAMP_DESIGN_PORTAL_PUBLIC=1 .venv/bin/modal deploy deploy/modal/portal.py
 ```
+
+Set the password literally rather than generating it into a shell variable:
+Modal will not read a secret's value back to you, so a generated password you
+did not write down is lost, and creating the secret in a shell where the
+generate step never ran stores `""`. The gate refuses an empty password rather
+than ignoring it, but the simpler command avoids the question.
 
 Deploying public without the gate is refused at import time. `min_containers=1`
 keeps one instance warm, which is why this does not have Cloud Run's cold-start

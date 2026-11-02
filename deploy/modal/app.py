@@ -1921,7 +1921,11 @@ def main(
 # torch, ViennaRNA or the checkpoints. See docs/HANDOFF.md, shape A.
 #
 # SETUP (once):
-#   modal secret create lamp-design-api --from-literal LAMP_DESIGN_API_KEYS="$(openssl rand -hex 32)"
+#   modal secret create lamp-design-api LAMP_DESIGN_API_KEYS="$(openssl rand -hex 32)"
+#
+# KEY=VALUE is positional; there is no --from-literal flag (checked against
+# `modal secret create --help`, client 1.6.3). Print the key first if you need
+# to hand it to someone -- Modal will not read a secret's value back to you.
 #   LAMP_DESIGN_HTTP=1 modal deploy deploy/modal/app.py
 #
 # Rotation is additive: put both keys in the secret, update callers, drop the

@@ -1162,10 +1162,39 @@ def _gate_passed() -> bool:
 
     Unset `LAMP_DESIGN_PORTAL_PASSWORD` and the gate disappears entirely, so
     local runs and the Docker images are unaffected.
+
+    An *empty* password is a different thing from an unset one, and is refused
+    rather than ignored. This is not hypothetical: the documented setup is
+
+        PW=$(openssl rand -base64 12)
+        modal secret create ... LAMP_DESIGN_PORTAL_PASSWORD="$PW"
+
+    and running the second line in a shell where the first never ran creates
+    the secret with "". Treating that as "no gate configured" would have
+    turned a public URL into an ungated one, silently, which is exactly the
+    case the deploy-time check in deploy/modal/portal.py does NOT catch -- it
+    only looks at LAMP_DESIGN_PORTAL_NO_GATE. So this fails closed: nobody
+    gets in, and the page says why.
     """
-    expected = os.environ.get("LAMP_DESIGN_PORTAL_PASSWORD", "")
-    if not expected:
+    configured = os.environ.get("LAMP_DESIGN_PORTAL_PASSWORD")
+    if configured is None:
         return True
+    # Blank-check on the stripped value, but compare against the raw one: a
+    # password with meaningful trailing whitespace should still work.
+    if not configured.strip():
+        st.title("LAMP primer design")
+        st.error(
+            "This portal is gated, but the configured password is empty, so "
+            "nobody can be let in. Whoever deployed it should recreate the "
+            "secret with a real value:\n\n"
+            "```\n"
+            "PW=$(openssl rand -base64 12); echo \"$PW\"\n"
+            "modal secret create lamp-design-portal-auth \\\n"
+            '    LAMP_DESIGN_PORTAL_PASSWORD="$PW" --force\n'
+            "```"
+        )
+        return False
+    expected = configured
     if st.session_state.get("_gate_ok"):
         return True
 
