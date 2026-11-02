@@ -134,11 +134,16 @@ DEFAULT_MAX_WINDOW_MISMATCHES = int(
     engine_default("lamp_design.commands.evaluate", "DEFAULT_MAX_WINDOW_MISMATCHES", 6)
 )
 
-#: The engine's stride default is 1 (every anchor). That is the right default
-#: for a CLI run with a budget; for an interactive page it is minutes of wait on
-#: a first attempt, so the UI starts coarser and says what the trade is.
+#: Every anchor position, same as the engine and the CLI.
+#:
+#: This was 5, on my reasoning that stride 1 meant "minutes of wait" on an
+#: interactive page. That was wrong twice over: stride 1 is about 40 s on the
+#: GPU backend, and stride 1 was an explicit team decision I overrode without
+#: saying so. The effect was a portal that quietly evaluated a fifth of the
+#: positions while the run page advertised ~25,000 candidates. The UI does not
+#: get its own default for a design decision.
 ENGINE_DEFAULT_STRIDE = int(engine_default("lamp_design.generation", "DEFAULT_STRIDE", 1))
-DEFAULT_STRIDE = 5
+DEFAULT_STRIDE = ENGINE_DEFAULT_STRIDE
 
 #: Local runs share the Modal path's candidate cap. `generate_candidates` thins
 #: whole anchors at a uniform stride rather than truncating, so hitting it
@@ -150,6 +155,22 @@ MAX_CANDIDATE_SETS = int(os.environ.get("LAMP_DESIGN_MAX_CANDIDATE_SETS", "20000
 MASTER_MIXES: tuple[str, ...] = tuple(
     engine_default("lamp_design.types", "MASTER_MIXES", ("SS", "BST", "WS"))
 )
+#: What the UI actually offers. WS stays in MASTER_MIXES above because it is
+#: part of the model's frozen input contract -- the mix is a 3-way one-hot and
+#: removing a channel would invalidate the checkpoints -- but it is not offered
+#: as a choice. Team decision: SS and BST only. WS is also the thinnest slice
+#: of the training data by a wide margin (12,564 rows against SS 91,451 and
+#: BST 66,160), so predictions under it are the least supported.
+SELECTABLE_MASTER_MIXES: tuple[str, ...] = ("SS", "BST")
+
+#: Candidate sets laid down at each anchor: the canonical geometry plus
+#: DEFAULT_N_SAMPLED drawn from the normal distribution over the permitted
+#: length/spacing ranges. Read back from the engine so the UI cannot drift
+#: from what `lamp-design design` does with no flags.
+DEFAULT_N_GEOMETRIES: int = 1 + int(
+    engine_default("lamp_design.generation", "DEFAULT_N_SAMPLED", 4)
+)
+
 MASTER_MIX_LABELS = {
     "BST": "BST — BstXT-dk",
     "SS": "SS",

@@ -260,7 +260,7 @@ class TestWeightsResolution:
     ):
         """The only way to reach the error now is a checkout that lost them."""
         monkeypatch.setattr(
-            "lamp_design.models.inference.BUNDLED_WEIGHTS", tmp_path / "gone"
+            "lamp_design.paths.BUNDLED_WEIGHTS", tmp_path / "gone"
         )
         with pytest.raises(WeightsError) as exc:
             resolve_weights(None, env={})
@@ -273,7 +273,7 @@ class TestWeightsResolution:
         self, monkeypatch, tmp_path
     ):
         monkeypatch.setattr(
-            "lamp_design.models.inference.BUNDLED_WEIGHTS", tmp_path / "gone"
+            "lamp_design.paths.BUNDLED_WEIGHTS", tmp_path / "gone"
         )
         assert resolve_weights(None, env={}, required=False) is None
 

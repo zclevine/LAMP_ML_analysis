@@ -20,6 +20,7 @@ import json
 import shutil
 import sys
 from pathlib import Path
+from unittest import mock
 
 import pytest
 
@@ -810,6 +811,15 @@ def _portal():
     return portal
 
 
+def _portal_module(name: str):
+    """Import one of the portal's Streamlit-importing modules by name."""
+    import importlib
+    import sys
+
+    sys.path.insert(0, str(APP_DIR))
+    return importlib.import_module(name)
+
+
 def test_the_scope_sentence_names_candidates_targets_and_concentrations():
     scope = _portal().describe_scope(
         {
@@ -1059,3 +1069,99 @@ def test_portal_deploy_flags_are_baked_into_the_image():
     assert portal.index("_PUBLIC_FLAG =") < portal.index("portal_image = "), (
         "the image definition needs the flags, so they must precede it"
     )
+
+
+def test_remote_backend_does_not_block_on_missing_local_torch_or_viennarna():
+    """The deployed portal has neither, by design, and must still run.
+
+    deploy/modal/portal.py and perf/Dockerfile.thin install lamp_design with
+    no torch and no ViennaRNA, because the design runs in our Modal container.
+    preflight_checks() nonetheless demanded both unconditionally, so every run
+    on the hosted portal was blocked with
+
+        No module named 'torch'
+        Neither the in-process ViennaRNA bindings nor the RNAduplex binary is
+        available, so dG -- a frozen model input -- cannot be computed.
+
+    on a deployment whose actual compute path was healthy. Found by a user
+    pressing the button, not by this suite -- which had tested that the
+    container starts and that a local CLI run works, neither of which
+    exercises this.
+    """
+    layout = _portal_module("_layout")
+
+    with mock.patch.object(layout, "_backend") as backend, \
+         mock.patch.object(layout, "weights_status") as weights, \
+         mock.patch.object(layout, "tool_status") as tools:
+        backend.active_backend.return_value = "modal-single"
+        weights.return_value = (False, "No module named 'torch'")
+        tools.return_value = {"mafft": None, "RNAduplex": None, "RNA bindings": None}
+        blockers, _ = layout.preflight_checks()
+
+    joined = " ".join(blockers)
+    assert "torch" not in joined, f"remote backend blocked on local torch: {blockers}"
+    assert "RNAduplex" not in joined, f"remote backend blocked on local dG: {blockers}"
+    assert "ViennaRNA" not in joined, f"remote backend blocked on local dG: {blockers}"
+
+
+def test_local_backend_still_blocks_on_missing_torch_or_viennarna():
+    """The gate above must not become a blanket exemption.
+
+    With LAMP_DESIGN_BACKEND=local the run really does happen here, so a
+    missing model or missing dG backend is a genuine blocker and has to stay
+    one -- otherwise the fix for the remote case hides a real failure in the
+    local case.
+    """
+    layout = _portal_module("_layout")
+
+    with mock.patch.object(layout, "_backend") as backend, \
+         mock.patch.object(layout, "weights_status") as weights, \
+         mock.patch.object(layout, "tool_status") as tools:
+        backend.active_backend.return_value = "local"
+        weights.return_value = (False, "No module named 'torch'")
+        tools.return_value = {"mafft": None, "RNAduplex": None, "RNA bindings": None}
+        blockers, _ = layout.preflight_checks()
+
+    joined = " ".join(blockers)
+    assert "torch" in joined, f"local backend must block without a model: {blockers}"
+    assert "ViennaRNA" in joined, f"local backend must block without dG: {blockers}"
+
+
+def test_ws_is_not_offered_as_a_master_mix():
+    """Team decision: SS and BST only.
+
+    WS stays in the engine's MASTER_MIXES because the mix is a 3-way one-hot in
+    the frozen model contract and dropping a channel would invalidate the
+    checkpoints. It must simply not be offered.
+    """
+    api = _portal_module("_engine_api")
+    assert api.SELECTABLE_MASTER_MIXES == ("SS", "BST")
+    assert "WS" in api.MASTER_MIXES, "the encoding contract must keep its third channel"
+
+    source = (APP_DIR / "app.py").read_text()
+    assert "options=list(SELECTABLE_MASTER_MIXES)" in source, (
+        "the picker must offer the selectable set, not the encoding contract"
+    )
+
+
+def test_generation_and_hardware_are_not_user_knobs():
+    """Stride, geometries, device and threads are decisions, not preferences.
+
+    Stride and geometries-per-anchor come from the design notes (every
+    position, five sets each); exposing them let a user quarter their own
+    coverage without knowing it. Device and threads are the deployment's
+    business, and under a remote backend the device selector governs nothing.
+    """
+    source = (APP_DIR / "app.py").read_text()
+    for widget_key in ('key="p_stride"', 'key="p_n_geometries"',
+                       'key="p_device"', 'key="p_threads"'):
+        assert widget_key not in source, f"{widget_key} is still a user-facing widget"
+
+    # They must still be present in the request, at the engine's defaults.
+    layout = _portal_module("_layout")
+    for name in ("stride", "n_geometries", "device", "threads"):
+        assert name in layout.DEFAULT_PARAMS, f"{name} dropped out of the request"
+    assert layout.DEFAULT_PARAMS["n_geometries"] == 5, (
+        "five sets per anchor: canonical plus four sampled"
+    )
+    assert layout.DEFAULT_PARAMS["stride"] == 1, "every position, per the design notes"

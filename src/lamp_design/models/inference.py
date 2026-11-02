@@ -53,6 +53,8 @@ from pathlib import Path
 from typing import Dict, List, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
+
+from lamp_design import paths
 import torch
 
 from lamp_design.models.fastpath import enable_kernel_cache
@@ -106,7 +108,12 @@ class WeightsNotFound(RuntimeError):
 #: 2.8 MB together, so bundling them costs nothing and buys a repo that runs
 #: on clone with no download, no mount and no environment variable -- which is
 #: the whole handoff story (docs/HANDOFF.md).
-BUNDLED_WEIGHTS = Path(__file__).resolve().parent.parent / "weights" / "tp60_A_v0t9"
+#:
+#: Defined in :mod:`lamp_design.paths`, which imports nothing heavy, so that
+#: weight resolution works in the thin portal image where torch is absent.
+#: Re-exported here because this is where callers expect to find it. Patch
+#: ``lamp_design.paths.BUNDLED_WEIGHTS``, not this alias.
+BUNDLED_WEIGHTS = paths.BUNDLED_WEIGHTS
 
 
 def resolve_weights_dir(explicit: Optional[str | os.PathLike] = None) -> Path:
@@ -119,11 +126,11 @@ def resolve_weights_dir(explicit: Optional[str | os.PathLike] = None) -> Path:
     """
     candidate = explicit or os.environ.get("LAMP_DESIGN_WEIGHTS")
     if not candidate:
-        if BUNDLED_WEIGHTS.is_dir():
-            return BUNDLED_WEIGHTS
+        if paths.BUNDLED_WEIGHTS.is_dir():
+            return paths.BUNDLED_WEIGHTS
         raise WeightsNotFound(
             "No model weights found. The bundled ensemble should be at "
-            f"{BUNDLED_WEIGHTS} and is missing, which means an incomplete "
+            f"{paths.BUNDLED_WEIGHTS} and is missing, which means an incomplete "
             "checkout or a build that dropped package data. Pass --weights "
             "<dir> or set LAMP_DESIGN_WEIGHTS to a directory containing "
             "seed_*/ subdirectories, each with one best_model_*.pt."

@@ -60,6 +60,7 @@ import _layout  # noqa: E402
 import _results  # noqa: E402
 from _engine_api import (  # noqa: E402
     MASTER_MIXES,
+    SELECTABLE_MASTER_MIXES,
     MAX_CANDIDATE_SETS,
     MIN_TARGET_LENGTH,
     PREDICTIONS_PER_SECOND_CPU,
@@ -609,9 +610,8 @@ def _render_estimate(params: dict) -> None:
         f"{estimate['seconds']:.0f} s" if minutes < 2 else f"{minutes:.1f} min",
     )
     st.caption(
-        "One prediction is a (set, target, condition) triple through all five seeds. "
-        "The estimate scales the measured 2,292 predictions/s on one L4; "
-        "thermodynamics and reporting add roughly 11% on top."
+        "Each candidate set is scored against every one of your sequences, at "
+        "every condition."
     )
     if estimate["candidates"] >= MAX_CANDIDATE_SETS:
         st.warning(
@@ -668,11 +668,11 @@ def _page_parameters() -> None:
         left, right = st.columns(2)
         params["master_mixes"] = left.multiselect(
             "Master mixes",
-            options=list(MASTER_MIXES),
+            options=list(SELECTABLE_MASTER_MIXES),
             default=params["master_mixes"],
             format_func=_layout.master_mix_label,
             key="p_master_mixes",
-            help="The model is conditioned on the master mix as a 3-way one-hot.",
+            help="SS and BST only; see SELECTABLE_MASTER_MIXES for why WS is not offered.",
         )
         params["concentrations"] = right.multiselect(
             "Template concentrations (copies/reaction)",
@@ -695,7 +695,7 @@ def _page_parameters() -> None:
             "table shows how it degrades."
         )
         rank_left, rank_right = st.columns(2)
-        mixes = params["master_mixes"] or list(MASTER_MIXES)
+        mixes = params["master_mixes"] or list(SELECTABLE_MASTER_MIXES)
         concentrations = params["concentrations"] or list(TRAINED_CONCENTRATIONS)
         params["rank_master_mix"] = rank_left.selectbox(
             "Rank under master mix",
@@ -717,46 +717,20 @@ def _page_parameters() -> None:
         )
 
     if _layout.workflow() == "design":
-        with st.expander("Candidate generation", expanded=True):
-            st.caption(
-                "Candidates are laid down at every anchor position along the consensus, "
-                "with a small fixed set of spacing/length geometries at each. The whole "
-                "input is tiled: there is no conserved-region pre-selection, because "
-                "more conserved sites should score better on their own."
-            )
-            left, right = st.columns(2)
-            params["stride"] = left.number_input(
-                "Anchor stride (nt)",
-                min_value=1,
-                max_value=500,
-                value=int(params["stride"]),
-                step=1,
-                key="p_stride",
-                help=(
-                    "Step between candidate anchor positions. 1 evaluates every position "
-                    "(the engine's own default) and costs the most; larger strides trade "
-                    "coverage for time."
-                ),
-            )
-            available = n_available_geometries()
-            params["n_geometries"] = right.number_input(
-                "Geometries per anchor",
-                min_value=1,
-                max_value=available,
-                value=min(int(params["n_geometries"]), available),
-                step=1,
-                key="p_n_geometries",
-                help=(
-                    f"How many of the engine's {available} deterministic geometries to lay "
-                    "down at each anchor. They are ordered canonical-first, so any number "
-                    "includes the canonical (5,0,0,5,0,0,5,0) spacing at length 19-20, "
-                    "where the model is best calibrated."
-                ),
-            )
-            labels = geometry_labels()
-            if labels:
-                chosen = ", ".join(f"`{name}`" for name in labels[: params["n_geometries"]])
-                st.caption(f"In use: {chosen}")
+        # Stride and geometries-per-anchor are NOT user knobs. They are design
+        # decisions from the design notes (every position, five sets each), and
+        # exposing them invited a user to silently quarter their own coverage.
+        # They stay in `params` at the engine's defaults so the request is
+        # complete; an operator changes them through the CLI or the API.
+        st.caption(
+            "**Candidate generation.** Every position along the alignment is "
+            "tried. At each one, five primer sets are laid down: the canonical "
+            "geometry — spacings (5,0,0,5,0,0,5,0) at the LML median lengths, "
+            "where the model is best calibrated — plus four whose lengths and "
+            "spacings are drawn from a normal distribution across the "
+            "permitted range. No conserved-region pre-selection: more "
+            "conserved sites should score better on their own merits."
+        )
 
         with st.expander("Ranking and output", expanded=True):
             left, right = st.columns(2)
@@ -828,38 +802,13 @@ def _page_parameters() -> None:
                 ),
             )
 
-    with st.expander("Compute"):
-        st.caption(
-            f"Backend `{_backend.active_backend()}`, set by `LAMP_DESIGN_BACKEND` rather "
-            "than here: which compute a deployment may reach is an operator's decision."
-        )
-        left, right = st.columns(2)
-        params["device"] = left.selectbox(
-            "Inference device",
-            options=["auto", "cuda", "cpu"],
-            index=["auto", "cuda", "cpu"].index(params["device"]),
-            key="p_device",
-            help=(
-                f"`auto` resolves to `{resolved_device()}` here. The GPU is worth about "
-                "15x on this pipeline, which is what makes it the primary path rather "
-                "than an optimization."
-            ),
-        )
-        params["threads"] = right.number_input(
-            "Thermodynamics threads (0 = all cores)",
-            min_value=0,
-            max_value=64,
-            value=int(params["threads"]),
-            step=1,
-            key="p_threads",
-            help=(
-                "Threads for ΔG and alignment. Thermodynamics is about 10% of a run, so "
-                "this is a small lever next to the device."
-            ),
-        )
+    # No device or thread pickers. Hardware is the deployment's business, not
+    # the user's: with a remote backend the local device selector governs
+    # nothing at all, and thermodynamics threading is a few percent of a run.
+    # Both stay in `params` at their defaults ("auto", all cores).
 
     st.divider()
-    st.subheader("Estimated cost")
+    st.subheader("Estimated run time")
     _render_estimate(params)
 
     st.divider()

@@ -26,6 +26,7 @@ from _engine_api import (
     DEFAULT_CENSOR_MINUTES,
     DEFAULT_CONCENTRATIONS,
     DEFAULT_MASTER_MIXES,
+    DEFAULT_N_GEOMETRIES,
     DEFAULT_MAX_WINDOW_MISMATCHES,
     DEFAULT_MIN_SEPARATION,
     DEFAULT_N_SETS,
@@ -69,7 +70,10 @@ DEFAULT_PARAMS: dict[str, Any] = {
     "rank_conc": max(DEFAULT_CONCENTRATIONS),
     "n_sets": DEFAULT_N_SETS,
     "stride": DEFAULT_STRIDE,
-    "n_geometries": min(4, n_available_geometries()),
+    # Five per position: the canonical geometry plus four sampled.
+    # This was min(4, ...), an arbitrary cap that silently gave one
+    # fewer set per anchor than the design calls for.
+    "n_geometries": DEFAULT_N_GEOMETRIES,
     "tp_threshold_minutes": DEFAULT_TP_THRESHOLD,
     "min_separation": DEFAULT_MIN_SEPARATION,
     "pre_aligned": False,
@@ -416,9 +420,23 @@ def preflight_checks() -> tuple[list[str], list[str]]:
         elif not primer_check.ok:
             blockers.extend(primer_check.errors)
 
-    weights_ok, weights_message = weights_status()
-    if not weights_ok:
-        blockers.append(weights_message)
+    # Weights and ViennaRNA are LOCAL capabilities, so they only block a LOCAL
+    # run. With a remote backend the design happens in the Modal container,
+    # which has torch and ViennaRNA; this container deliberately has neither
+    # (deploy/modal/portal.py, perf/Dockerfile.thin drop them because compute
+    # is elsewhere). Checking them unconditionally blocked every run on the
+    # deployed portal with "No module named 'torch'" and "Neither the
+    # in-process ViennaRNA bindings nor the RNAduplex binary is available" --
+    # on a portal whose actual compute path was fine.
+    if _backend.active_backend() == "local":
+        weights_ok, weights_message = weights_status()
+        if not weights_ok:
+            blockers.append(weights_message)
+        if not tools["RNA bindings"] and not tools["RNAduplex"]:
+            blockers.append(
+                "Neither the in-process ViennaRNA bindings nor the RNAduplex binary "
+                "is available, so ΔG -- a frozen model input -- cannot be computed."
+            )
 
     if not params["master_mixes"]:
         blockers.append("Select at least one master mix on the Parameters step.")
@@ -444,12 +462,6 @@ def preflight_checks() -> tuple[list[str], list[str]]:
             f"({check.min_len:,}-{check.max_len:,} nt), so they are not an "
             "alignment. Align them and trim to a gapless block, or submit one "
             "sequence."
-        )
-
-    if not tools["RNA bindings"] and not tools["RNAduplex"]:
-        blockers.append(
-            "Neither the in-process ViennaRNA bindings nor the RNAduplex binary is "
-            "available, so ΔG -- a frozen model input -- cannot be computed."
         )
 
     if _backend.active_backend() == "local" and resolved_device() == "cpu":

@@ -28,6 +28,8 @@ from typing import Optional, Tuple
 from lamp_design import __version__
 
 #: Environment variable holding the trained-checkpoint directory.
+from lamp_design import paths
+
 WEIGHTS_ENV_VAR = "LAMP_DESIGN_WEIGHTS"
 
 #: No subcommand given.
@@ -99,16 +101,20 @@ def resolve_weights(
     if raw is None or raw == "":
         # Nothing configured: use the ensemble shipped inside the package. This
         # is why `lamp-design design` works on a fresh clone with no flags.
-        from lamp_design.models.inference import BUNDLED_WEIGHTS
-
-        if BUNDLED_WEIGHTS.is_dir():
-            return BUNDLED_WEIGHTS
+        #
+        # Read through the `paths` module rather than importing the constant
+        # from models.inference, which does `import torch` at module scope.
+        # The thin portal installs this package WITHOUT torch -- compute is
+        # remote -- so importing it there made resolution fail with
+        # "No module named 'torch'" on weights that were sitting right there.
+        if paths.BUNDLED_WEIGHTS.is_dir():
+            return paths.BUNDLED_WEIGHTS
         if not required:
             return None
         raise WeightsError(
             "model weights are not configured, and the bundled ensemble is "
-            f"missing from {BUNDLED_WEIGHTS}. That means an incomplete checkout "
-            "or a build that dropped package data. Pass --weights "
+            f"missing from {paths.BUNDLED_WEIGHTS}. That means an incomplete "
+            "checkout or a build that dropped package data. Pass --weights "
             f"/path/to/checkpoints or set {WEIGHTS_ENV_VAR}=/path/to/checkpoints; "
             "that directory holds the five-seed ensemble as "
             "seed_*/.../best_model_*.pt (see docs/ARCHITECTURE.md)."

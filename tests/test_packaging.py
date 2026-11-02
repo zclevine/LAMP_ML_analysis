@@ -22,6 +22,7 @@ import re
 import sys
 import subprocess
 import tempfile
+import textwrap
 
 import pytest
 
@@ -289,3 +290,63 @@ def test_no_dangling_symlinks_among_the_bundled_weights():
     for checkpoint in sorted(BUNDLED_WEIGHTS.rglob("*.pt")):
         assert not checkpoint.is_symlink(), f"{checkpoint} is a symlink, not data"
         assert checkpoint.stat().st_size > 100_000, f"{checkpoint} is suspiciously small"
+
+
+def test_weights_resolve_without_torch():
+    """The thin portal installs this package with no torch, on purpose.
+
+    deploy/streamlit/perf/Dockerfile.thin and deploy/modal/portal.py omit torch
+    because compute runs remotely; they still import lamp_design to validate
+    input and report where the weights are. Resolution used to import
+    BUNDLED_WEIGHTS from models.inference, which does `import torch` at module
+    scope, so the deployed portal reported "Weights: not configured" with
+    "No module named 'torch'" underneath -- on weights that were present and
+    fine. The lookup simply could not get far enough to see them.
+
+    Run in a subprocess with torch blocked at import, because this process has
+    torch installed and so cannot observe the failure.
+    """
+    probe = textwrap.dedent(
+        """
+        import sys
+
+        class Block:
+            def find_spec(self, name, path=None, target=None):
+                if name == "torch" or name.startswith("torch."):
+                    raise ModuleNotFoundError("No module named 'torch'")
+                return None
+
+        sys.meta_path.insert(0, Block())
+
+        from lamp_design.cli import resolve_weights
+
+        resolved = resolve_weights(None, env={})
+        assert resolved is not None and resolved.is_dir(), resolved
+        assert "torch" not in sys.modules, "torch was imported after all"
+        print("OK", resolved)
+        """
+    )
+    done = subprocess.run(
+        [sys.executable, "-c", probe], capture_output=True, text=True, timeout=300,
+        cwd=str(REPO),
+    )
+    assert done.returncode == 0, f"{done.stdout}\n{done.stderr}"
+    assert done.stdout.startswith("OK"), done.stdout
+
+
+def test_the_paths_module_imports_nothing_heavy():
+    """Its only job is to be importable where torch and numpy are not.
+
+    Checked statically: a future edit that adds a convenience import here
+    would silently reintroduce the bug above.
+    """
+    tree = ast.parse((REPO / "src" / "lamp_design" / "paths.py").read_text())
+    imported = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            imported.update(alias.name.split(".")[0] for alias in node.names)
+        elif isinstance(node, ast.ImportFrom) and node.module:
+            imported.add(node.module.split(".")[0])
+    assert imported <= {"pathlib", "__future__"}, (
+        f"paths.py must stay standard-library only; found {sorted(imported)}"
+    )
