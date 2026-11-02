@@ -218,6 +218,33 @@ def evaluate_metrics_frame(result: dict) -> pd.DataFrame:
     )
 
 
+def evaluate_ranking_frame(result: dict) -> pd.DataFrame:
+    """The supplied primer sets, ranked fastest-first. No Tp column.
+
+    Ranking is the product, in Evaluate exactly as in Design: the model's
+    minute figure orders the sets and is not shown.
+    """
+    frame = predictions_frame(result)
+    if frame.empty or not {"primer_set", "predicted_tp_minutes"} <= set(frame.columns):
+        return pd.DataFrame()
+    ordered = (
+        frame.groupby("primer_set")["predicted_tp_minutes"]
+        .mean()
+        .sort_values()
+        .reset_index()
+        .drop(columns=["predicted_tp_minutes"])
+    )
+    ordered.insert(0, "rank", range(1, len(ordered) + 1))
+    return ordered
+
+
+def evaluate_predictions_display(result: dict) -> pd.DataFrame:
+    """``predictions_frame`` with the predicted-Tp columns dropped."""
+    frame = predictions_frame(result)
+    drop = [c for c in ("predicted_tp_minutes", "predicted_tp_std") if c in frame.columns]
+    return frame.drop(columns=drop)
+
+
 def evaluate_matrix(result: dict) -> pd.DataFrame:
     """Rows = primer sets, columns = targets, values = mean predicted Tp.
 

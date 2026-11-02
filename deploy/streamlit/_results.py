@@ -14,7 +14,8 @@ import streamlit as st
 import _backend
 from _tables import (
     INCLUSIVITY_FIELD,
-    evaluate_matrix,
+    evaluate_predictions_display,
+    evaluate_ranking_frame,
     evaluate_metrics_frame,
     is_evaluate,
     predictions_frame,
@@ -119,16 +120,14 @@ def render_envelope(envelope: dict) -> None:
         st.dataframe(primers, hide_index=True)
 
     st.subheader("Downloads")
-    columns = st.columns(4)
+    columns = st.columns(3)
     with columns[0]:
         _download("Ranked sets (CSV)", sets, f"lamp_sets_{run_id}.csv", f"dl-sets-{run_id}")
     with columns[1]:
-        _download("Tp matrix (CSV)", tp, f"lamp_tp_{run_id}.csv", f"dl-tp-{run_id}")
-    with columns[2]:
         _download(
             "Mismatches (CSV)", mismatches, f"lamp_mismatches_{run_id}.csv", f"dl-mm-{run_id}"
         )
-    with columns[3]:
+    with columns[2]:
         _download("Primers (CSV)", primers, f"lamp_primers_{run_id}.csv", f"dl-primers-{run_id}")
 
     _render_engine_artifacts(run_id)
@@ -192,10 +191,8 @@ def render_evaluate(envelope: dict) -> None:
         f"{frame['primer_set'].nunique():,}" if "primer_set" in frame.columns else "—",
     )
     columns[2].metric(
-        "Mean predicted Tp",
-        f"{frame['predicted_tp_minutes'].mean():.1f} min"
-        if "predicted_tp_minutes" in frame.columns and not frame.empty
-        else "—",
+        "Targets",
+        f"{frame['target'].nunique():,}" if "target" in frame.columns else "—",
     )
     columns[3].metric("Runtime", f"{timing.get('total', 0):.0f} s")
 
@@ -204,7 +201,6 @@ def render_evaluate(envelope: dict) -> None:
         st.caption(
             "Scored under "
             + ", ".join(f"`{label}`" for label in params["conditions"])
-            + f" on `{params.get('device', '?')}`"
             + (
                 ". Those conditions replaced whatever the input file said, so a warning "
                 "above about defaulting the master mix or concentration describes the "
@@ -230,32 +226,26 @@ def render_evaluate(envelope: dict) -> None:
         )
         st.dataframe(metrics, hide_index=True)
 
-    matrix = evaluate_matrix(result)
-    tab_labels = ["Predictions"] + (["Tp by target"] if not matrix.empty else [])
-    tabs = st.tabs(tab_labels)
+    ranking = evaluate_ranking_frame(result)
+    detail = evaluate_predictions_display(result)
+    tabs = st.tabs(["Ranked sets", "Per target"])
     with tabs[0]:
-        st.caption(
-            "One row per (primer set, target, condition). `predicted_tp_minutes` is "
-            "minutes to amplification — lower is faster; `predicted_tp_std` is the "
-            "spread across the five ensemble seeds."
-        )
-        st.dataframe(frame, hide_index=True)
-    if not matrix.empty:
-        with tabs[1]:
-            st.caption("Mean predicted Tp per set against each target sequence.")
-            st.dataframe(matrix, hide_index=True)
+        st.caption("Your primer sets, best first. Rank 1 is the fastest predicted.")
+        st.dataframe(ranking, hide_index=True)
+    with tabs[1]:
+        st.caption("One row per (primer set, target, condition).")
+        st.dataframe(detail, hide_index=True)
 
     st.subheader("Downloads")
     columns = st.columns(2)
     with columns[0]:
         _download(
-            "Predictions (CSV)", frame, f"lamp_predictions_{run_id}.csv", f"dl-pred-{run_id}"
+            "Ranked sets (CSV)", ranking, f"lamp_eval_ranking_{run_id}.csv", f"dl-rank-{run_id}"
         )
-    if not matrix.empty:
-        with columns[1]:
-            _download(
-                "Tp matrix (CSV)", matrix, f"lamp_eval_tp_{run_id}.csv", f"dl-evaltp-{run_id}"
-            )
+    with columns[1]:
+        _download(
+            "Per target (CSV)", detail, f"lamp_predictions_{run_id}.csv", f"dl-pred-{run_id}"
+        )
     _render_engine_artifacts(run_id)
 
 
