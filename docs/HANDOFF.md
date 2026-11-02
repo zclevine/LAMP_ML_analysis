@@ -167,6 +167,14 @@ correction and shifts every Tm by +2.17 °C away from the values the model was
 trained on. Pinned in `pyproject.toml`, the Dockerfile and the Modal image —
 all three must agree.
 
+**Input must be a pre-aligned, gapless panel.** Every sequence the same
+length, no `-` characters. Ragged input is refused rather than aligned, and a
+gapped alignment is refused outright: generation has no concept of an
+alignment gap, so a gapped panel would silently place primers over columns
+most of the panel does not cover. Align and trim to the shared region first.
+`examples/H5N1_HA_demo.fasta` is a worked example of the right shape — ten H5N1
+genomes aligned and trimmed to a 1,715 nt gapless core.
+
 **Ambiguity codes are rejected, not cleaned.** `N`/`R`/`Y` in an input sequence
 is an error with the position named. Silently substituting a base would change
 the design without telling you. Six of the 53 sequences in PrimerCast's `H5.fa`
@@ -198,11 +206,9 @@ starts. Everything else (compression, request count, JS parse) is smaller.
    set out of the returned 20 entirely**.
 2. **No off-target / specificity screening.** Accepted for v1. A reviewer will
    ask.
-3. **No dimer/hairpin ΔG filter.** Settled in `ARCHITECTURE.md`, not yet
-   implemented. The model never saw non-specific amplification, so this has to
-   happen outside it.
-4. **Gap columns are warned about, not excluded.** The design notes say primers
-   should avoid gapped regions; `prepare` currently only warns above 50%.
+3. **No dimer/hairpin ΔG filter, by decision.** The model never saw
+   non-specific amplification, so this would have to happen outside it. The
+   team chose not to screen for it in v1 — the LML design did not either.
 5. **Fan-out is not a speedup for one run.** `design_fanout` exists and works,
    but a whole sweep is 84 GPU-seconds, so splitting it leaves each shard less
    work than its own cold start. Use `design_single_container` for a single

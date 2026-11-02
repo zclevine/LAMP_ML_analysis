@@ -147,7 +147,10 @@ class TestDispatch:
         assert exc.value.code == EXIT_INPUT_ERROR
         err = capsys.readouterr().err
         assert err.startswith("error: ")
-        assert "'hbv'" in err and "position 101" in err and "--pre-aligned" in err
+        # Names the sequence, the position, and what to do -- but no longer
+        # offers --pre-aligned, which is no longer a way past a gap.
+        assert "'hbv'" in err and "position 101" in err
+        assert "not supported" in err and "--pre-aligned" not in err
 
     def test_over_budget_exits_2(self, tmp_path, capsys):
         path = tmp_path / "big.fa"

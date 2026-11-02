@@ -109,7 +109,7 @@ class TestPanelShape:
         assert panel.alignment == [seq for _, seq in records]
         assert panel.consensus == plurality_consensus([s for _, s in records])
         assert panel.budget == 4 * 300
-        assert any("treated as already aligned" in w for w in prepared.warnings)
+        assert any("treated as an alignment" in w for w in prepared.warnings)
 
     def test_multi_sequence_unequal_length_is_aligned(self):
         records = [("long", make_seq(300)), ("short", make_seq(250, shift=3))]
@@ -128,13 +128,22 @@ class TestPanelShape:
         assert "-" not in panel.consensus
         assert prepared.alignment_names == ["long", "short"]
 
-    def test_force_align_overrides_the_equal_length_shortcut(self):
+    def test_force_align_is_refused(self):
+        """It asked for the one thing the gapless rule forbids.
+
+        Aligning introduces gap columns; gapped alignments are refused. The
+        flag used to override the equal-length shortcut and run the aligner,
+        which under the current policy would produce a panel the next stage
+        rejects.
+        """
         records = [(f"s{i}", make_seq(300, shift=i)) for i in range(3)]
         aligner = RecordingAligner()
 
-        prepare_panel(records, aligner=aligner, force_align=True)
+        with pytest.raises(InputError) as exc:
+            prepare_panel(records, aligner=aligner, force_align=True)
 
-        assert len(aligner.calls) == 1
+        assert "not supported" in str(exc.value)
+        assert aligner.calls == [], "nothing should have been aligned"
 
     def test_equal_weighting_for_v1(self):
         records = [(f"s{i}", make_seq(300, shift=i)) for i in range(3)]
@@ -179,7 +188,11 @@ class TestRejections:
         assert "HBV_AY123456" in message, "names the offending sequence"
         assert "position 101" in message, "names the position (1-based)"
         assert "3 gap character" in message
-        assert "--pre-aligned" in message, "says how to proceed deliberately"
+        # No longer offers --pre-aligned as a way in: gaps are refused from
+        # every source. The message has to say what to do instead.
+        assert "--pre-aligned" not in message
+        assert "not supported" in message
+        assert "trim the alignment" in message.lower(), "says what to do instead"
         assert exc.value.name == "HBV_AY123456"
 
     def test_gapped_input_rejected_even_when_other_sequences_are_clean(self):
@@ -368,20 +381,24 @@ class TestBudgetCap:
 
 
 class TestAlignment:
-    def test_missing_mafft_tells_the_user_to_pre_align(self, monkeypatch):
-        import lamp_design.external.mafft as mafft
+    def test_ragged_input_is_refused_rather_than_aligned(self):
+        """Ragged input is a user error now, not a job for MAFFT.
 
-        monkeypatch.setattr(mafft, "mafft_available", lambda: False)
+        Aligning it would introduce the very gap columns the gapless rule
+        exists to keep out, so running an aligner here and then rejecting its
+        own output would be incoherent. MAFFT being installed or not makes no
+        difference, which is why this test no longer stubs it.
+        """
         records = [("a", make_seq(300)), ("b", make_seq(250, shift=1))]
 
         with pytest.raises(InputError) as exc:
             prepare_panel(records)
 
         message = str(exc.value)
-        assert "MAFFT was not found" in message
-        assert "will not guess" in message
-        assert "--pre-aligned" in message
-        assert "conda install" in message
+        assert "differ in length" in message
+        assert "not an alignment" in message
+        assert "gapless" in message
+        assert "trim" in message.lower()
 
     def test_single_sequence_never_needs_mafft(self, monkeypatch):
         import lamp_design.external.mafft as mafft
@@ -389,18 +406,36 @@ class TestAlignment:
         monkeypatch.setattr(mafft, "mafft_available", lambda: False)
         assert prepare_panel([("solo", make_seq(300))]).panel.n_targets == 1
 
-    def test_pre_aligned_accepts_gaps_and_degaps_the_targets(self):
+    def test_pre_aligned_still_refuses_gaps(self):
+        """Team decision: the panel must be pre-aligned AND gapless.
+
+        --pre-aligned used to be the flag that *permitted* gaps, which was
+        exactly backwards: it is the flag real alignments arrive with, and
+        generation has no concept of an alignment gap, so primers were placed
+        over columns the majority of the panel does not cover.
+        """
         row_a = make_seq(200) + "-" * 10 + make_seq(100, shift=1)
         row_b = make_seq(200) + make_seq(10, shift=7) + make_seq(100, shift=1)
+
+        with pytest.raises(SequenceValidationError) as exc:
+            prepare_panel([("a", row_a), ("b", row_b)], pre_aligned=True)
+
+        message = str(exc.value)
+        assert "Gapped alignments are not supported" in message
+        assert "trim the alignment" in message.lower()
+
+    def test_a_gapless_rectangular_panel_is_accepted(self):
+        """The shape the pipeline now requires, and what it does with it."""
+        row_a = make_seq(300)
+        row_b = make_seq(300, shift=1)
 
         prepared = prepare_panel([("a", row_a), ("b", row_b)], pre_aligned=True)
         panel = prepared.panel
 
         assert panel.alignment == [row_a, row_b]
-        assert len(panel.targets[0].sequence) == 300, "target sequences are ungapped"
-        assert len(panel.targets[1].sequence) == 310
+        assert len(panel.targets[0].sequence) == 300
         assert "-" not in panel.consensus
-        assert panel.budget == 2 * 310, "budget uses the alignment width"
+        assert panel.budget == 2 * 300
 
     def test_pre_aligned_requires_a_rectangular_alignment(self):
         with pytest.raises(InputError) as exc:

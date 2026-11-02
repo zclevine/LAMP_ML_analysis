@@ -146,6 +146,13 @@ does not resolve inside it. Do not re-clip at 0: doing so creates ties at the
 top of the ranking and we measured it **dropping the model's own best set out
 of the returned 20**.
 
+### Input must be pre-aligned and gapless
+
+Every sequence the same length, no `-`. Ragged input is refused rather than
+aligned; a gapped alignment is refused outright. Generation has no concept of
+an alignment gap, so a gapped panel would place primers over columns most of
+the panel does not cover. Surface the error text — it says what to do.
+
 ### Ambiguity codes are rejected, not cleaned
 
 `N`/`R`/`Y` in an input is an error naming the position. Silently substituting
@@ -264,12 +271,9 @@ green tick — `.github/workflows/ci.yml` prints it deliberately.
 ## 8. Known gaps, so you do not go looking for them
 
 1. **No off-target / specificity screening.** Accepted for v1.
-2. **No dimer/hairpin ΔG filter.** The model never saw non-specific
-   amplification, so this has to happen outside it. Not yet built.
-3. **Gap-rich alignment columns are warned about, not excluded** from tiling.
-   On the demo panel 1.2% of candidates have a primer over a column that is
-   ≥50% gaps.
-4. **Design quality is unvalidated.** Ranking is reproducible and the model
+2. **No dimer/hairpin ΔG filter**, by decision rather than omission. The LML
+   design did not screen for it either.
+3. **Design quality is unvalidated.** Ranking is reproducible and the model
    reproduces published accuracy on held-out pathogens; that top-ranked sets
    are *good* sets needs wet-lab confirmation.
 

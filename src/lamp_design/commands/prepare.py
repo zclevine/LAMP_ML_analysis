@@ -193,7 +193,14 @@ def prepare_panel(
 
     # --- 1. Base composition. A problem here rejects the run, by design. ----
     for name, seq in records:
-        validate_sequence(name, seq, allow_gaps=pre_aligned)
+        # allow_gaps=False unconditionally, including under --pre-aligned.
+        # Team decision: the user supplies a pre-aligned, GAPLESS panel, and a
+        # gapped alignment is refused rather than tiled over. The previous
+        # `allow_gaps=pre_aligned` let gaps through on exactly the flag people
+        # use for real alignments, and generation has no concept of an
+        # alignment gap -- so primers were being placed across columns where
+        # the consensus came from a minority of the panel.
+        validate_sequence(name, seq, allow_gaps=False)
     diag.record(
         "Base composition QC (A/C/G/T only, no gaps)",
         len(records),
@@ -387,31 +394,44 @@ def _align_if_needed(
     if pre_aligned:
         return list(records)
 
+    if force_align:
+        raise InputError(
+            "--force-align is not supported: aligning here would introduce gap "
+            "columns, and gapped alignments are refused (a primer cannot be "
+            "placed over a column most of the panel does not cover). Align and "
+            "trim the panel to a gapless region yourself, then run without this "
+            "flag."
+        )
+
     widths = {len(seq) for _, seq in records}
-    if len(widths) == 1 and not force_align:
+    if len(widths) == 1:
         # Ungapped and all the same length: already an alignment (no indels to
         # represent). Nothing is modified, so this is safe -- but say so.
         warnings.append(
-            f"all {len(records)} sequences are {widths.pop():,} nt with no gaps, so they "
-            "are treated as already aligned and MAFFT was not run. Pass --force-align "
-            "if they are not actually aligned column-for-column."
+            f"all {len(records)} sequences are {widths.pop():,} nt with no gaps, so "
+            "they are treated as an alignment and used as given. If they are not "
+            "actually aligned column-for-column, align and trim them before "
+            "running -- lamp-design cannot tell the difference."
         )
         return list(records)
 
     if aligner is None:
-        from lamp_design.external import mafft
-
-        if not mafft.mafft_available():
-            lengths = sorted(len(seq) for _, seq in records)
-            raise InputError(
-                f"MAFFT was not found on PATH and the {len(records)} input sequences "
-                f"differ in length ({lengths[0]:,}-{lengths[-1]:,} nt), so they have to "
-                "be aligned before a consensus can be derived. lamp-design will not "
-                "guess at an alignment. Either install MAFFT "
-                f"({mafft.MAFFT_INSTALL_HINT}), or align the sequences yourself and "
-                "re-run with --pre-aligned."
-            )
-        aligner = mafft.align_records
+        # Ragged input is refused rather than aligned. Aligning it would
+        # introduce exactly the gap columns that gapless-input rule exists to
+        # keep out, so running MAFFT here and then rejecting its own output
+        # would be incoherent. The design notes settled this -- "We can just
+        # tell the user to align their sequences" -- and this is that, enforced.
+        lengths = sorted(len(seq) for _, seq in records)
+        raise InputError(
+            f"the {len(records)} input sequences differ in length "
+            f"({lengths[0]:,}-{lengths[-1]:,} nt), so they are not an alignment. "
+            "lamp-design needs a pre-aligned, gapless panel: every sequence the "
+            "same length, with no '-' characters. Align them yourself (MAFFT, "
+            "MUSCLE, Clustal), then trim to the region all sequences share so no "
+            "gaps remain, and re-run. Gapped alignments are not supported -- "
+            "primers cannot be placed over a column that most of the panel does "
+            "not cover."
+        )
 
     rows = list(aligner(records, threads))
     if len(rows) != len(records):

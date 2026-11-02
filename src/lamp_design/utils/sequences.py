@@ -287,12 +287,14 @@ def validate_sequence(
         if gaps:
             raise SequenceValidationError(
                 f"sequence '{name}' contains {len(gaps)} gap character(s), first at "
-                f"position {gaps[0]} ('{seq[gaps[0] - 1]}'). Gapped input is rejected: "
-                "lamp-design designs against ungapped sequences and builds its own "
-                "alignment, so a gapped FASTA is either an alignment or a corrupted "
-                "sequence and guessing which would be wrong. Either supply the "
-                "sequences without gaps (they will be aligned with MAFFT), or pass "
-                "--pre-aligned to declare that this file *is* the alignment.",
+                f"position {gaps[0]} ('{seq[gaps[0] - 1]}'). "
+                "Gapped alignments are not supported. A primer cannot be placed "
+                "over a column that most of the panel does not cover, and the "
+                "design stage has no concept of an alignment gap, so a gapped "
+                "panel would silently produce primers against a consensus built "
+                "from a minority of the sequences. Supply a pre-aligned, gapless "
+                "panel: trim the alignment to the region every sequence shares, "
+                "so no '-' remains, then re-run.",
                 name=name,
             )
 
