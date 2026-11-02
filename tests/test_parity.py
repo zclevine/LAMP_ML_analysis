@@ -16,7 +16,6 @@ the suite stays runnable without them.
 
 from __future__ import annotations
 
-import os
 from pathlib import Path
 
 import numpy as np
@@ -39,8 +38,11 @@ PUBLISHED_CSV = LYRA_ROOT / "export" / "A_tp60c" / "mpox.csv"
 JOIN_KEYS = ["primer_set", "target_seq", "target_conc", "master_mix"]
 
 
+from _weights import weights_or_none
+
+
 def _weights_dir() -> str | None:
-    return os.environ.get("LAMP_DESIGN_WEIGHTS")
+    return weights_or_none()
 
 
 requires_reference = pytest.mark.skipif(

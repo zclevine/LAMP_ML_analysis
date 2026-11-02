@@ -434,11 +434,11 @@ def test_summary_says_so_when_there_is_no_truth_column():
 
 
 def _weights_or_skip() -> str:
-    import os
+    from _weights import WEIGHTS_MISSING_REASON, weights_or_none
 
-    weights = os.environ.get("LAMP_DESIGN_WEIGHTS")
-    if not weights or not Path(weights).exists():
-        pytest.skip("LAMP_DESIGN_WEIGHTS is not set to an existing path")
+    weights = weights_or_none()
+    if weights is None:
+        pytest.skip(WEIGHTS_MISSING_REASON)
     return weights
 
 

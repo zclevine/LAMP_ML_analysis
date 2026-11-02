@@ -242,3 +242,50 @@ def test_both_dockerfiles_run_the_dg_reference_check_or_pin_the_version():
     modal = (REPO / "deploy" / "modal" / "app.py").read_text()
     assert "RNADUPLEX_EXPECTED_VERSION" in modal
     assert 'RNAduplex --version | grep -q' in modal, "Modal image does not assert its pin"
+
+
+def test_the_bundled_weights_are_present_and_complete():
+    """All five seeds, where the library expects them.
+
+    A missing seed would not crash: `discover_checkpoints` returns whatever it
+    finds and the ensemble would quietly average over four models instead of
+    five, shifting every prediction by a small amount nobody would notice.
+    """
+    from lamp_design.models.inference import (
+        BUNDLED_WEIGHTS,
+        discover_checkpoints,
+        resolve_weights_dir,
+    )
+
+    assert BUNDLED_WEIGHTS.is_dir(), f"bundled weights missing from {BUNDLED_WEIGHTS}"
+    assert sorted(discover_checkpoints(BUNDLED_WEIGHTS)) == [0, 1, 2, 3, 42]
+    # Nothing configured must resolve to them -- this is what makes a clone run.
+    assert resolve_weights_dir() == BUNDLED_WEIGHTS
+
+
+def test_the_weights_are_declared_as_package_data():
+    """Otherwise `pip install .` and every Docker build drop them silently.
+
+    The failure mode is nasty: the source tree works, the wheel does not, and
+    the error surfaces only when someone installs rather than clones. Checked
+    statically against the packaging metadata, for the same reason as the
+    dependency check above.
+    """
+    config = (REPO / "pyproject.toml").read_text()
+    assert "[tool.setuptools.package-data]" in config, "no package-data section"
+    assert "weights/*/*/*.pt" in config, (
+        "the weights glob is not declared, so a built wheel will not contain them"
+    )
+
+
+def test_no_dangling_symlinks_among_the_bundled_weights():
+    """They were symlinks into a training run before being committed.
+
+    `cp -rL` dereferenced them; a future re-copy with plain `cp -r` would
+    commit links that resolve on this machine and nowhere else.
+    """
+    from lamp_design.models.inference import BUNDLED_WEIGHTS
+
+    for checkpoint in sorted(BUNDLED_WEIGHTS.rglob("*.pt")):
+        assert not checkpoint.is_symlink(), f"{checkpoint} is a symlink, not data"
+        assert checkpoint.stat().st_size > 100_000, f"{checkpoint} is suspiciously small"

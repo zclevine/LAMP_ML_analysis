@@ -11,9 +11,9 @@ that already exist). Each lives in its own module under ``commands/`` and is
 discovered by name, so adding a fourth means adding a module and one line in
 :func:`build_parser`, not restructuring this one.
 
-Model weights are never bundled (see ``docs/ARCHITECTURE.md``). They are
-resolved from ``--weights`` or ``$LAMP_DESIGN_WEIGHTS`` by
-:func:`resolve_weights`, which is the one place that policy lives.
+Model weights ship inside the package (see ``docs/ARCHITECTURE.md``). They are
+resolved from ``--weights``, then ``$LAMP_DESIGN_WEIGHTS``, then the bundled
+ensemble, by :func:`resolve_weights` -- the one place that policy lives.
 """
 
 from __future__ import annotations
@@ -50,7 +50,7 @@ class WeightsError(ValueError):
 
 
 # ---------------------------------------------------------------------------
-# Weights resolution -- never bundled, always resolved at run time
+# Weights resolution -- bundled by default, overridable at run time
 # ---------------------------------------------------------------------------
 
 
@@ -60,8 +60,9 @@ def add_weights_argument(parser: argparse.ArgumentParser) -> None:
         "--weights",
         default=None,
         help="Trained checkpoint directory (holding seed_*/.../best_model_*.pt). "
-             f"Defaults to ${WEIGHTS_ENV_VAR}. Weights are never bundled with this "
-             "package.",
+             f"Defaults to ${WEIGHTS_ENV_VAR}, then to the five-seed ensemble "
+             "bundled with this package -- so this flag is only needed to run a "
+             "different model.",
     )
 
 
@@ -96,15 +97,21 @@ def resolve_weights(
         source, raw = f"${WEIGHTS_ENV_VAR}", env.get(WEIGHTS_ENV_VAR)
 
     if raw is None or raw == "":
+        # Nothing configured: use the ensemble shipped inside the package. This
+        # is why `lamp-design design` works on a fresh clone with no flags.
+        from lamp_design.models.inference import BUNDLED_WEIGHTS
+
+        if BUNDLED_WEIGHTS.is_dir():
+            return BUNDLED_WEIGHTS
         if not required:
             return None
         raise WeightsError(
-            "model weights are not configured. The trained Simplified Lyra "
-            "checkpoints are deliberately never bundled with this package, so they "
-            "have to be pointed at: pass --weights /path/to/checkpoints or set "
-            f"{WEIGHTS_ENV_VAR}=/path/to/checkpoints. That directory holds the "
-            "five-seed ensemble as seed_*/.../best_model_*.pt (see "
-            "docs/ARCHITECTURE.md)."
+            "model weights are not configured, and the bundled ensemble is "
+            f"missing from {BUNDLED_WEIGHTS}. That means an incomplete checkout "
+            "or a build that dropped package data. Pass --weights "
+            f"/path/to/checkpoints or set {WEIGHTS_ENV_VAR}=/path/to/checkpoints; "
+            "that directory holds the five-seed ensemble as "
+            "seed_*/.../best_model_*.pt (see docs/ARCHITECTURE.md)."
         )
 
     path = Path(raw).expanduser()
@@ -141,7 +148,7 @@ Examples:
   lamp-design design --in panel.json --out sets.tsv --weights /path/to/checkpoints
   lamp-design evaluate --in my_primers.tsv --targets panel.json --out scores.tsv
 
-Model weights are never bundled: pass --weights or set {WEIGHTS_ENV_VAR}.
+Model weights ship with this package; --weights / {WEIGHTS_ENV_VAR} override them.
 
 For more information on a specific command:
   lamp-design <command> --help

@@ -17,7 +17,6 @@ portal (`/home/ssiddiqu/PrimerCast/gui/app.py`) so the two feel like one family:
 cd /home/ssiddiqu/lamp-design
 .venv/bin/pip install streamlit
 
-LAMP_DESIGN_WEIGHTS=/path/to/checkpoints \
 .venv/bin/streamlit run deploy/streamlit/app.py \
     --server.headless true --server.port 8512 --server.maxUploadSize 5
 ```
@@ -88,7 +87,7 @@ left and returned to.
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `LAMP_DESIGN_WEIGHTS` | unset | Checkpoint directory. **Unset is a preflight blocker**, not a late traceback. |
+| `LAMP_DESIGN_WEIGHTS` | unset → bundled | Checkpoint directory. Unset uses the ensemble shipped in the package; a path that is set but missing is a preflight blocker, not a late traceback. |
 | `LAMP_DESIGN_BACKEND` | `local` | `local`, `modal` (= `modal-single`) or `modal-fanout`. |
 | `LAMP_DESIGN_DATA_DIR` | repo root | Root for persisted runs (`<root>/runs/<run_id>`). **The seam for durable storage.** |
 | `LAMP_DESIGN_MAX_UPLOAD_MB` | `5` | Upload cap enforced in the app. Keep in step with `--server.maxUploadSize`. |

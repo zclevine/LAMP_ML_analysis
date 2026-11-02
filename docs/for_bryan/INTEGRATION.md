@@ -27,7 +27,13 @@ constraint everything else follows from.
 |---|---|---|
 | Remote GPU (recommended) | `design_single_container` in [`deploy/modal/app.py`](../../deploy/modal/app.py) | 1 GPU + 8 CPU |
 | HTTP front door | `http_submit` / `http_status`, same file | thin client calls these |
-| Local CPU | `lamp_design.commands.design.design()` | whatever the container has |
+| Local CPU or local GPU | `lamp_design.commands.design.design()` | whatever the container has |
+
+**The model ships in the repo.** All five checkpoints are 2.8 MB, inside the
+package at `src/lamp_design/weights/`, so there is nothing to download, mount
+or request, and every shape below works on a clone. `LAMP_DESIGN_WEIGHTS` or
+`--weights` overrides for a retrain; a path that is set but missing raises
+rather than falling back, so a typo cannot silently swap the model.
 
 ---
 
@@ -35,8 +41,10 @@ constraint everything else follows from.
 
 ### Shape A — thin client calling our HTTP endpoints (least for you to own)
 
-Your container needs **Streamlit + `requests`**. No torch, no model weights,
-no Modal SDK. We hold the GPU and the weights.
+Your container needs **Streamlit + `requests`**. No torch, no Modal SDK, no
+pinned scientific dependencies. We hold the GPU, so the version constraints in
+§4 — primer3 below 2.1, the ViennaRNA ΔG reference — stay on our side of the
+wire and are not yours to maintain. That is the main argument for this shape.
 
 Endpoints are in [`deploy/modal/app.py`](../../deploy/modal/app.py), section
 `HTTP front door`, deployed with `LAMP_DESIGN_HTTP=1 modal deploy`:
@@ -66,14 +74,39 @@ modal deploy deploy/modal/app.py
 ```
 
 Then Shape A pointed at your own endpoints, or the Modal SDK directly
-(`modal.Function.from_name`). You own the bill and the weights upload. See
+(`modal.Function.from_name`). You own the bill. See
 [`deploy/modal/README.md`](../../deploy/modal/README.md) — the volume upload is
 the only fiddly step, and its symlink trap is documented there.
 
 ### Shape C — everything in your container, CPU only
 
-`LAMP_DESIGN_BACKEND=local`. Self-contained, no third-party compute.
-See §6 for whether it fits your limits.
+`LAMP_DESIGN_BACKEND=local`. Self-contained, no third-party compute, no
+dependency on us at all. See §6 for whether it fits your limits.
+
+### Shape D — everything in your container, on a Cloud Run GPU
+
+Cloud Run supports **NVIDIA L4** GPUs, generally available, no quota request
+for the starter allotment (3 per region, granted on first deploy), and it
+scales to zero. That makes an all-Google deployment viable: `Dockerfile` as is,
+`--gpu 1 --gpu-type nvidia-l4`, `LAMP_DESIGN_BACKEND=local`.
+
+What to know before choosing it:
+
+- **L4, not L40S.** We measured both: L4 **37 s**, L40S **19 s** for a full
+  stride-1 run on the demo panel. Fine for a portal, 2× off the best available.
+- **GPU requires instance-based billing**, so you pay for the instance's whole
+  life, not per request — including the scaledown window after a run finishes.
+- **Minimum 4 CPU + 16 GiB** alongside the L4. Turn *off* zonal redundancy; it
+  is on by default for new services and costs more.
+- **The cold start gets worse, not better**: a GPU image plus driver init plus
+  checkpoint load. Google's own published AI cold starts are 11–35 s. If the
+  same service also serves the UI, that lands on the user as a blank page (§5).
+  The fix is the same two-service split as every other shape: a thin always-warm
+  front end, and the GPU behind it scaling to zero.
+
+This is a supported destination rather than a hypothetical: the backend is a
+seam (`LAMP_DESIGN_BACKEND`, already with two implementations) and the engine
+has no Modal dependency in it.
 
 ---
 
@@ -242,6 +275,10 @@ concurrent users and oversized inputs, not for latency.
 ## 7. Verifying an integration
 
 ```bash
+# 0. The engine, with nothing configured at all. Should just work.
+lamp-design design --in examples/H5N1_HA_demo.fasta --stride 60 --top 5 \
+    --out /tmp/smoke
+
 # 1. Environment is capable at all (CPU, ~30s, no GPU billed)
 modal run deploy/modal/app.py --mode doctor
 
@@ -262,9 +299,10 @@ it reports tool versions, whether the weights volume resolves, and
 layer calls still exists. Two of the five bugs found during bring-up were
 caught here, before any GPU time was billed.
 
-The test suite is 496 tests; `pytest -q`. Tests needing real weights skip
-without `LAMP_DESIGN_WEIGHTS`, so check the skip count rather than trusting a
-green tick — `.github/workflows/ci.yml` prints it deliberately.
+The test suite is **506 tests, 0 skipped**; `pytest -q`. Everything runs,
+including the tests that load real checkpoints and predict — they used to skip
+for want of weights and now do not, because the weights are in the package. A
+green tick means the model path was actually exercised.
 
 ---
 

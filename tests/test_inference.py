@@ -9,7 +9,6 @@ the reference pipeline's, and both clipped the same way.
 
 from __future__ import annotations
 
-import os
 import pathlib
 
 import pytest
@@ -111,9 +110,11 @@ def test_pairs_sharing_a_dedup_key_encode_identically():
     from lamp_design.models.inference import LyraEnsemble
     from lamp_design.types import Condition
 
-    weights = os.environ.get("LAMP_DESIGN_WEIGHTS")
-    if not weights or not pathlib.Path(weights).exists():
-        pytest.skip("LAMP_DESIGN_WEIGHTS not set")
+    from _weights import WEIGHTS_MISSING_REASON, weights_or_none
+
+    weights = weights_or_none()
+    if weights is None:
+        pytest.skip(WEIGHTS_MISSING_REASON)
 
     table, sets, _ = _demo_thermo()
     groups: dict = {}
@@ -142,9 +143,11 @@ def test_dedup_preserves_count_order_and_values_within_device_noise():
     from lamp_design.models.inference import LyraEnsemble
     from lamp_design.types import Condition
 
-    weights = os.environ.get("LAMP_DESIGN_WEIGHTS")
-    if not weights or not pathlib.Path(weights).exists():
-        pytest.skip("LAMP_DESIGN_WEIGHTS not set")
+    from _weights import WEIGHTS_MISSING_REASON, weights_or_none
+
+    weights = weights_or_none()
+    if weights is None:
+        pytest.skip(WEIGHTS_MISSING_REASON)
 
     table, sets, _ = _demo_thermo()
     conditions = [Condition("SS", 10000.0), Condition("SS", 100.0)]

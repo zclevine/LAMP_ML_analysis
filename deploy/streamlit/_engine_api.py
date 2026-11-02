@@ -231,10 +231,12 @@ def resolved_device() -> str:
 def weights_status() -> tuple[bool, str]:
     """``(ok, message)`` for the configured checkpoint directory.
 
-    Weights are never bundled, so "not configured" is the single most likely
-    reason a run fails, and it is worth saying before the run rather than in a
-    traceback. Resolution goes through the engine's own policy
-    (``cli.resolve_weights``) so there is not a second copy of it here.
+    Weights are bundled, so the common case is simply fine and this check is
+    cheap reassurance. It still earns its place: a ``LAMP_DESIGN_WEIGHTS`` that
+    is set but wrong, or a build that dropped package data, is worth reporting
+    before a run rather than as a traceback afterwards. Resolution goes through
+    the engine's own policy (``cli.resolve_weights``) so there is not a second
+    copy of it here.
     """
     explicit = os.environ.get("LAMP_DESIGN_WEIGHTS") or None
     try:

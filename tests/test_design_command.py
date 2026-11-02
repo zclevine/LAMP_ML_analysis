@@ -8,7 +8,6 @@ so the wiring is exercised rather than asserted about.
 from __future__ import annotations
 
 import json
-import os
 
 import numpy as np
 import pytest
@@ -44,11 +43,14 @@ def _fasta(tmp_path, n: int = 3, length: int = 700, name: str = "targets.fa"):
     return path
 
 
+from _weights import WEIGHTS_MISSING_REASON, weights_or_none
+
+
 def _weights():
-    return os.environ.get("LAMP_DESIGN_WEIGHTS")
+    return weights_or_none()
 
 
-requires_weights = pytest.mark.skipif(_weights() is None, reason="LAMP_DESIGN_WEIGHTS not set")
+requires_weights = pytest.mark.skipif(_weights() is None, reason=WEIGHTS_MISSING_REASON)
 
 
 # --------------------------------------------------------------- conditions

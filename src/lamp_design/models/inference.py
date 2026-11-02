@@ -4,9 +4,11 @@ The shipped model is a 5-seed ensemble (seeds 0, 1, 2, 3, 42) of a
 bidirectional PGC + S4D Lyra, ``d_model=64``, ``dropout=0.2``, 101,121
 parameters each. Predictions are the arithmetic mean over seeds.
 
-Weights are **not** bundled with this package. Point ``LAMP_DESIGN_WEIGHTS`` (or
-``--weights``) at a directory containing ``seed_*/`` subtrees, each holding one
-``best_model_*.pt``.
+Weights **are** bundled with this package, under ``weights/tp60_A_v0t9/`` --
+all five seeds are 2.8 MB together, so there is nothing to download and
+nothing to configure. To use a different ensemble, point
+``LAMP_DESIGN_WEIGHTS`` (or ``--weights``) at a directory containing
+``seed_*/`` subtrees, each holding one ``best_model_*.pt``.
 
 Each checkpoint carries everything needed for inference:
 
@@ -100,15 +102,31 @@ class WeightsNotFound(RuntimeError):
     """Raised when the checkpoint directory cannot be located or is incomplete."""
 
 
+#: The production ensemble, shipped inside the package. All five seeds are
+#: 2.8 MB together, so bundling them costs nothing and buys a repo that runs
+#: on clone with no download, no mount and no environment variable -- which is
+#: the whole handoff story (docs/HANDOFF.md).
+BUNDLED_WEIGHTS = Path(__file__).resolve().parent.parent / "weights" / "tp60_A_v0t9"
+
+
 def resolve_weights_dir(explicit: Optional[str | os.PathLike] = None) -> Path:
-    """Find the checkpoint root: explicit argument, else ``LAMP_DESIGN_WEIGHTS``."""
+    """Find the checkpoint root.
+
+    Order: explicit argument, then ``LAMP_DESIGN_WEIGHTS``, then the bundled
+    ensemble. The fallback is last so that a configured path which does not
+    exist still raises -- silently substituting a different model for the one
+    someone asked for would change results without telling anyone.
+    """
     candidate = explicit or os.environ.get("LAMP_DESIGN_WEIGHTS")
     if not candidate:
+        if BUNDLED_WEIGHTS.is_dir():
+            return BUNDLED_WEIGHTS
         raise WeightsNotFound(
-            "No model weights location given. Pass --weights <dir> or set "
-            "LAMP_DESIGN_WEIGHTS to a directory containing seed_*/ subdirectories, "
-            "each with one best_model_*.pt. Weights are intentionally not "
-            "distributed with this package."
+            "No model weights found. The bundled ensemble should be at "
+            f"{BUNDLED_WEIGHTS} and is missing, which means an incomplete "
+            "checkout or a build that dropped package data. Pass --weights "
+            "<dir> or set LAMP_DESIGN_WEIGHTS to a directory containing "
+            "seed_*/ subdirectories, each with one best_model_*.pt."
         )
     path = Path(candidate).expanduser()
     if not path.is_dir():

@@ -39,6 +39,16 @@ lamp-design = "lamp_design.cli:main"
 [tool.setuptools.packages.find]
 where = ["src"]
 
+# The five-seed ensemble ships inside the package: 2.8 MB total, so a clone or
+# a `pip install` runs with no configuration and no separate download. An
+# explicit --weights or $LAMP_DESIGN_WEIGHTS still overrides, which is how you
+# point at a retrained ensemble.
+[tool.setuptools.package-data]
+lamp_design = ["weights/*/*/*.pt"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-pythonpath = ["src"]
+# "tests" is here so test modules can import shared helpers by name (see
+# tests/_weights.py). Relying on pytest's prepend-import-mode side effect to
+# put tests/ on sys.path does not work once pythonpath is set explicitly.
+pythonpath = ["src", "tests"]

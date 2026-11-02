@@ -6,16 +6,23 @@ prints a URL. Share that with teammates; nothing else to set up.
 
 WHY THIS AND NOT STREAMLIT COMMUNITY CLOUD / HUGGING FACE / RENDER
 ------------------------------------------------------------------
-All of those need the model weights to reach them, and the weights are
-deliberately out of git (public portal trajectory, provisional patent). Any of
-them would mean either committing 2.8 MB of checkpoints to a repo a third party
-clones, or standing up a secrets pipeline for a demo.
+This used to be decided by the weights: they were out of git, and none of those
+services could have them. That reason is gone -- the 2.8 MB ensemble now ships
+in the package -- so Community Cloud is genuinely an option, and if all you
+want is a link for teammates it is a reasonable one.
 
-Modal already holds the weights, in the `lamp-design-weights` Volume, and
-already runs the GPU function. So serving the UI from the same workspace adds
-no new place for the weights to live, no new credential to manage, and no new
-bill. The portal container here is a thin client: it submits to
-`design_single_container` and polls, exactly as a Cloud Run deployment would.
+Two reasons this is still the better demo:
+
+* **No GPU there.** A full stride-1 run would take the CPU path: 241 s
+  measured on 8 cores, versus ~19 s here. A demo that takes four minutes
+  demonstrates the wrong thing.
+* **Memory.** A local run peaks at 3.43 GB RSS, which is at or above the
+  per-app allowance on the free tiers. Worth measuring before relying on it.
+
+Modal already runs the GPU function, so serving the UI from the same workspace
+adds no new credential and no new bill. The portal container here is a thin
+client: it submits to `design_single_container` and polls, exactly as a Cloud
+Run deployment would.
 
 ACCESS -- read this before sharing a link
 -----------------------------------------
@@ -39,9 +46,10 @@ deploy/streamlit/app.py and is honest about what it is: one shared password in
 front of a demo, not authentication. It identifies nobody and is exactly as
 private as the people who know it.
 
-Deploying public *without* the gate is refused at import time, because the
-weights are kept out of git while the patent application is pending and a
-public ungated URL would quietly undo that.
+Deploying public *without* the gate is refused at import time. The weights are
+no longer the reason -- they ship in the repo now -- but an ungated URL still
+puts GPU spend behind an unauthenticated endpoint, which the budget guardrails
+in app.py should not be the only thing standing in front of.
 
 COLD START
 ----------
@@ -137,9 +145,8 @@ PORTAL_SECRET_NAME = os.environ.get(
 PORTAL_PUBLIC = os.environ.get("LAMP_DESIGN_PORTAL_PUBLIC") == "1"
 USE_PASSWORD = PORTAL_PUBLIC or os.environ.get("LAMP_DESIGN_PORTAL_GATE") == "1"
 
-# A public URL with no gate would put the portal -- and the designs it
-# produces from weights kept out of git while the patent is pending -- on the
-# open internet. Refuse at deploy time rather than discover it later.
+# A public URL with no gate would put GPU spend behind an unauthenticated
+# endpoint. Refuse at deploy time rather than discover it on a bill.
 if PORTAL_PUBLIC and os.environ.get("LAMP_DESIGN_PORTAL_NO_GATE") == "1":
     raise SystemExit(
         "refusing to deploy a public portal with the password gate disabled.\n"

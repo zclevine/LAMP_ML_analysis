@@ -7,7 +7,6 @@ weights are absent; everything up to inference runs unconditionally.
 
 from __future__ import annotations
 
-import os
 
 import numpy as np
 import pytest
@@ -49,11 +48,14 @@ def _plurality(rows):
     return "".join(out)
 
 
+from _weights import WEIGHTS_MISSING_REASON, weights_or_none
+
+
 def _weights():
-    return os.environ.get("LAMP_DESIGN_WEIGHTS")
+    return weights_or_none()
 
 
-requires_weights = pytest.mark.skipif(_weights() is None, reason="LAMP_DESIGN_WEIGHTS not set")
+requires_weights = pytest.mark.skipif(_weights() is None, reason=WEIGHTS_MISSING_REASON)
 
 
 def test_generation_to_thermo():

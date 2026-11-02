@@ -16,10 +16,8 @@
 #   docker build -t lamp-design:cpu .
 #   docker build -t lamp-design:portal -f Dockerfile.portal .
 #
-# Run locally:
-#   docker run --rm -p 8080:8080 \
-#     -v /host/path/checkpoints:/weights:ro \
-#     lamp-design:portal
+# Run locally (no weights mount -- they are bundled in the package):
+#   docker run --rm -p 8080:8080 lamp-design:portal
 #
 # -----------------------------------------------------------------------------
 # READ THIS BEFORE DEPLOYING TO CLOUD RUN

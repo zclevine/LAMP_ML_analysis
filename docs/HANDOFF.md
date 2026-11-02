@@ -24,21 +24,29 @@ and returns the 20 best sets spread across loci.
 | Portal image | `Dockerfile.portal` → `lamp-design:portal` | The Streamlit UI, on `$PORT`, Cloud Run contract. |
 | Modal harness | `deploy/modal/` | GPU compute as a service. Deployed, verified. |
 
-## You need the weights, and they are not in git
+## The weights are in the repo — there is nothing to obtain
 
-Deliberately — the portal is public-facing and there is a provisional patent
-application. Five checkpoints, 2.8 MB total:
+Five checkpoints, 2.8 MB total, inside the package:
 
 ```
-tp60_A_v0t9/seed_{0,1,2,3,42}/best_model.pt
+src/lamp_design/weights/tp60_A_v0t9/seed_{0,1,2,3,42}/best_model.pt
 ```
 
-Ask Sameed. Point `LAMP_DESIGN_WEIGHTS` at the directory that contains the
-`seed_*/` folders, or pass `--weights`.
+So `pip install -e .` or `docker build` is the whole setup. No download, no
+mount, no environment variable, no asking anyone for anything. The Docker build
+asserts all five seeds survived packaging, so a build that loses them fails
+rather than shipping a broken image.
 
-> **Trap:** in the dev checkout those five files are *symlinks* into a training
-> run directory. `docker cp`, `modal volume put` and `tar` will all happily copy
-> the links instead of the data. Dereference first: `cp -rL`.
+To run a **different** ensemble — a retrain, an ablation — point
+`LAMP_DESIGN_WEIGHTS` at a directory of `seed_*/` folders, or pass `--weights`.
+A configured path that does not exist raises rather than silently falling back
+to the bundled model, because substituting a different model for the one
+someone asked for would change results without telling them.
+
+> **Trap, only if you mount your own:** in a training run directory those `.pt`
+> files are often *symlinks*. `docker cp`, `modal volume put` and `tar` will all
+> happily copy the links instead of the data. Dereference first: `cp -rL`. The
+> bundled copies are already dereferenced.
 
 ## Hosted internal demo
 
@@ -67,14 +75,17 @@ problem.
 ## Try it in two minutes
 
 ```bash
-# GPU or CPU, whichever the box has
-LAMP_DESIGN_WEIGHTS=/path/to/tp60_A_v0t9 \
-  lamp-design design --in examples/H5N1_HA_demo.fasta --stride 1 --out /tmp/demo
+# GPU or CPU, whichever the box has. No flags, no environment: the weights
+# are in the package.
+lamp-design design --in examples/H5N1_HA_demo.fasta --stride 1 --out /tmp/demo
 ```
 
 `examples/H5N1_HA_demo.fasta` ships with the repo: ten 2025 H5N1 hemagglutinin
-genomes from NCBI, 1,715–1,751 nt, taken from PrimerCast's own `target_seqs/`.
-They are ragged, so the run exercises the MAFFT alignment path.
+genomes from NCBI, taken from PrimerCast's own `target_seqs/`, MAFFT-aligned
+and then trimmed to the largest *contiguous* gapless block — 1,715 of 1,751
+columns, 97.9% retained. All ten are the same length with no `-`, which is the
+input shape the engine requires, so it doubles as a worked example of
+conforming input.
 
 In Docker (`--user` matters — the image runs as a non-root user, so without it
 every write to `/data` fails with "Permission denied" *after* the pipeline has
@@ -84,17 +95,19 @@ done all its work):
 docker build -t lamp-design:cpu .
 
 docker run --rm --user "$(id -u):$(id -g)" \
-  -v /path/to/tp60_A_v0t9:/weights:ro \
-  -v "$PWD":/data -v "$PWD/examples":/examples:ro \
+  -v "$PWD":/data \
   lamp-design:cpu \
-  lamp-design design --in /examples/H5N1_HA_demo.fasta --stride 60 --out /data/demo
+  lamp-design design --in /app/examples/H5N1_HA_demo.fasta --stride 60 --out /data/demo
 ```
+
+(The demo panel is inside the image at `/app/examples/`, so there is nothing to
+mount for it either.)
 
 For the UI:
 
 ```bash
 docker build -t lamp-design:portal -f Dockerfile.portal .
-docker run --rm -p 8080:8080 -v /path/to/tp60_A_v0t9:/weights:ro lamp-design:portal
+docker run --rm -p 8080:8080 lamp-design:portal
 ```
 
 Then open <http://localhost:8080> and pick **Demo panel** on the Target step.

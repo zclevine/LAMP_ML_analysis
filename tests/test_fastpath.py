@@ -8,12 +8,12 @@ stock vendored path rather than assuming it.
 
 from __future__ import annotations
 
-import os
 
 import numpy as np
 import pytest
 import torch
 
+from _weights import WEIGHTS_MISSING_REASON, weights_or_none
 from lamp_design.models.fastpath import (
     cached_kernel_count,
     clear_kernel_cache,
@@ -158,14 +158,12 @@ def test_cache_does_not_pollute_state_dict():
     fresh.load_state_dict(model.state_dict(), strict=True)
 
 
-@pytest.mark.skipif(
-    os.environ.get("LAMP_DESIGN_WEIGHTS") is None, reason="LAMP_DESIGN_WEIGHTS not set"
-)
+@pytest.mark.skipif(weights_or_none() is None, reason=WEIGHTS_MISSING_REASON)
 def test_real_ensemble_predictions_unchanged():
     """End-to-end on the shipped checkpoints: same Tp, to the bit."""
     from lamp_design.models.inference import LyraEnsemble
 
-    weights = os.environ["LAMP_DESIGN_WEIGHTS"]
+    weights = weights_or_none()
     rng = np.random.default_rng(3)
     rows = [rng.random((L, 19)).astype(np.float32) for L in (150, 150, 167, 180, 180, 180)]
 

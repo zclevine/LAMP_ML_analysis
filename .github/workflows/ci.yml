@@ -35,8 +35,9 @@ jobs:
 
       # RNAduplex and MAFFT come from apt here for the same reason the Modal
       # image uses apt: the pinned 2.4.17 build is what the dG parity test
-      # expects. Tests needing real weights skip without LAMP_DESIGN_WEIGHTS,
-      # which CI does not have -- the weights are deliberately out of git.
+      # expects. The real-model tests RUN here, because the five-seed ensemble
+      # is bundled in the package (2.8 MB) -- so CI exercises checkpoint
+      # loading and prediction rather than skipping past them.
       - name: Install external tools
         run: |
           sudo add-apt-repository -y multiverse

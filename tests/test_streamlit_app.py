@@ -939,10 +939,10 @@ def test_the_gate_runs_before_anything_else():
 
 
 def test_the_hosted_portal_requires_a_gate_or_proxy_auth():
-    """A public URL with neither would expose the demo to the internet.
+    """A public URL with neither would put GPU spend behind an open endpoint.
 
-    The weights stay out of git while the patent is pending; the hosted portal
-    must not be the thing that undoes that.
+    The budget guardrails in deploy/modal/app.py should not be the only thing
+    between the internet and our bill.
     """
     source = (APP_DIR.parents[1] / "deploy" / "modal" / "portal.py").read_text()
     assert "requires_proxy_auth" in source

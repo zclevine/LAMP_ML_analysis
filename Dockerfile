@@ -12,39 +12,36 @@
 #     CUDA libraries are never written to a layer; removing them in a later
 #     layer would not shrink the image.
 #
-# Model weights are NOT baked in and never will be (docs/ARCHITECTURE.md).
-# They are mounted at run time and found via $LAMP_DESIGN_WEIGHTS, which this
-# image presets to /weights so the mount point is self-documenting.
+# Model weights ARE baked in: the five-seed ensemble lives inside the package
+# at src/lamp_design/weights/ and is 2.8 MB, so it costs nothing to carry and
+# means this image needs no weights mount, no download and no environment
+# variable. The build verifies below that all five seeds survived packaging.
 #
 # Build:
 #   docker build -t lamp-design:cpu .
 #
-# Run. Note the two mounts (read-only weights, read-write data) and `--user`:
-# the image runs as a non-root user, so without it every write to /data fails
-# with "Permission denied" *after* the pipeline has done all its work. Mapping
-# to the caller's uid also means the outputs are owned by them, not by root.
+# Run. One mount, and `--user`: the image runs as a non-root user, so without
+# it every write to /data fails with "Permission denied" *after* the pipeline
+# has done all its work. Mapping to the caller's uid also means the outputs
+# are owned by them, not by root.
 #
-#   docker run --rm --user "$(id -u):$(id -g)" \
-#     -v /host/path/tp60_A_v0t9:/weights:ro \
-#     -v "$PWD":/data \
+#   docker run --rm --user "$(id -u):$(id -g)" -v "$PWD":/data \
 #     lamp-design:cpu \
 #     lamp-design prepare --in /data/targets.fa --out /data/panel.json
 #
-#   docker run --rm --user "$(id -u):$(id -g)" \
-#     -v /host/path/tp60_A_v0t9:/weights:ro -v "$PWD":/data \
+#   docker run --rm --user "$(id -u):$(id -g)" -v "$PWD":/data \
 #     lamp-design:cpu \
 #     lamp-design design --in /data/panel.json --out /data/sets
 #
 # Verified 2026-11-01: a stride-60 design on examples/H5N1_HA_demo.fasta runs
 # to completion in-container in 15.4 s and writes all four outputs.
 #
-# The weights mount must be a *dereferenced* copy -- see docs/HANDOFF.md. In a
-# dev checkout the five .pt files are symlinks into a training directory, and
-# a bind mount of those gives the container dangling links.
-#
-# To put the checkpoints somewhere else, override the variable and the mount:
+# To run a *different* ensemble -- a retrain, an ablation -- mount it and say
+# so; a configured path that does not exist raises rather than falling back:
 #   -v /host/ckpts:/mnt/ckpts:ro -e LAMP_DESIGN_WEIGHTS=/mnt/ckpts
-# Either way `--weights` on the command line still wins.
+# Either way `--weights` on the command line still wins. Such a mount must be
+# a *dereferenced* copy: in a training directory the .pt files are often
+# symlinks, and a bind mount of those gives the container dangling links.
 
 FROM --platform=linux/amd64 mambaorg/micromamba:2.5.0-debian12-slim
 
@@ -129,10 +126,18 @@ RUN lamp-design --help > /dev/null \
     && python -c "import numpy, pandas, Bio, primer3, RNA, scipy, torch" \
     && python -c "import torch, sys; sys.exit(0 if torch.version.cuda is None else 'torch is not the CPU build')" \
     && python -c "from lamp_design.models.bridge import predict_tp; print('model path imports')" \
+    && python -c "\
+from lamp_design.models.inference import resolve_weights_dir, discover_checkpoints;\
+d = resolve_weights_dir();\
+c = discover_checkpoints(d);\
+assert sorted(c) == [0, 1, 2, 3, 42], f'expected 5 seeds, found {sorted(c)}';\
+print('bundled weights:', len(c), 'seeds at', d)" \
     && python /app/scripts/check_dg_reference.py
 
-# Weights are mounted here; nothing is baked in.
-ENV LAMP_DESIGN_WEIGHTS=/weights
+# No LAMP_DESIGN_WEIGHTS here on purpose. Leaving it unset lets the bundled
+# ensemble be the default; presetting it to a mount point that may not exist
+# would turn "docker run" into an error for the common case. Override it only
+# to run a different ensemble.
 
 WORKDIR /data
 CMD ["lamp-design", "--help"]

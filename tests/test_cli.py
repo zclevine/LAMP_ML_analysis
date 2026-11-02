@@ -244,15 +244,37 @@ class TestWeightsResolution:
         monkeypatch.setenv(WEIGHTS_ENV_VAR, str(tmp_path))
         assert resolve_weights() == tmp_path
 
-    def test_unset_is_an_error_naming_both_ways_to_set_it(self):
+    def test_unset_falls_back_to_the_bundled_ensemble(self):
+        """A fresh clone runs with no flags and no environment."""
+        from lamp_design.models.inference import BUNDLED_WEIGHTS
+
+        assert resolve_weights(None, env={}) == BUNDLED_WEIGHTS
+
+    def test_unset_still_resolves_when_not_required(self):
+        from lamp_design.models.inference import BUNDLED_WEIGHTS
+
+        assert resolve_weights(None, env={}, required=False) == BUNDLED_WEIGHTS
+
+    def test_missing_bundled_weights_is_an_error_naming_both_ways_to_set_it(
+        self, monkeypatch, tmp_path
+    ):
+        """The only way to reach the error now is a checkout that lost them."""
+        monkeypatch.setattr(
+            "lamp_design.models.inference.BUNDLED_WEIGHTS", tmp_path / "gone"
+        )
         with pytest.raises(WeightsError) as exc:
             resolve_weights(None, env={})
         message = str(exc.value)
         assert "--weights" in message
         assert WEIGHTS_ENV_VAR in message
-        assert "never bundled" in message
+        assert "bundled" in message
 
-    def test_unset_returns_none_when_not_required(self):
+    def test_missing_bundled_weights_returns_none_when_not_required(
+        self, monkeypatch, tmp_path
+    ):
+        monkeypatch.setattr(
+            "lamp_design.models.inference.BUNDLED_WEIGHTS", tmp_path / "gone"
+        )
         assert resolve_weights(None, env={}, required=False) is None
 
     def test_configured_but_missing_path_is_always_an_error(self, tmp_path):

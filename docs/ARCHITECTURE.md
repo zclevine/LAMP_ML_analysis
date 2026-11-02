@@ -73,8 +73,16 @@ Checkpoint: `LAMP_experiment_20260905_021750_tp60_A_v0t9/seed_*/…/best_model_*
 - the 34 physics feature names with `mean`/`std` — the physics standardizer
 - `label_mean` / `label_std` — to recover predictions in minutes
 
-Weights live **outside** this repo. Resolve via `LAMP_DESIGN_WEIGHTS` (env var)
-or `--weights`; never commit them.
+Weights live **inside** this repo, at `src/lamp_design/weights/tp60_A_v0t9/` —
+all five seeds are 2.8 MB together, so a clone runs with no download and no
+configuration. `LAMP_DESIGN_WEIGHTS` or `--weights` overrides them, for a
+retrain or an ablation.
+
+They were originally kept out of git, for a provisional patent application that
+has since been filed and a repo that is going open source anyway. Bundling them
+is what collapses the handoff to "clone it" — which is the whole reason it
+changed. Note that **git history is permanent**: these 2.8 MB are public from
+the moment the repo is pushed, and removing them later does not unpublish them.
 
 Input encoding is 19 channels: 8 ACGT (primer + target) + 1 spacer + 3 master-mix
 + 1 concentration + 6 physics (4 per-primer broadcast + 2 global).
