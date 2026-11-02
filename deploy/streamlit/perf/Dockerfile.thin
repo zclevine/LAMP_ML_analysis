@@ -1,0 +1,105 @@
+# The portal as a thin client: UI only, compute on Modal.
+#
+# WHY THIS EXISTS
+# ---------------
+# A Cloud Run cold start is dominated by mounting the image and importing the
+# ML stack before a byte is served. `Dockerfile.portal` is 3.4 GB because it
+# can run the engine locally -- torch alone is 447 MB of site-packages, plus
+# ViennaRNA and MAFFT.
+#
+# But with LAMP_DESIGN_BACKEND=modal none of that is ever executed: the design
+# run happens in our Modal workspace, and this container only validates input,
+# submits, polls, and renders. So the heavy half is pure cold-start tax.
+#
+# This image drops it. What stays is what the UI genuinely touches:
+#   * streamlit, to serve the page
+#   * modal, to submit and poll
+#   * lamp_design itself WITHOUT torch -- model imports are function-local on
+#     purpose (see `lamp-design --help`), so generation/validation/report
+#     import fine, which is what the input checks and the geometry count need
+#   * numpy, biopython, primer3-py -- the non-model dependencies those touch
+#
+# What goes:
+#   * torch (447 MB)        -- only `models/` uses it, and that runs remotely
+#   * ViennaRNA, MAFFT      -- thermo and alignment run remotely
+#
+# This is the answer to "does the Streamlit server have to be the thing that is
+# active immediately?" -- it does, because it serves the page, but it does not
+# have to be *big*. Making the always-on thing small beats standing up a second
+# service in front of it, and it needs no extra moving parts.
+#
+# TRADEOFF
+# --------
+# This image CANNOT run a design locally. LAMP_DESIGN_BACKEND=local will fail
+# at inference with a missing torch. That is deliberate and asserted at build
+# time below, so the limitation surfaces in a build log rather than in a user's
+# first run. Use `Dockerfile.portal` if you need local compute.
+#
+# BUILD
+#   docker build -t lamp-design:thin -f deploy/streamlit/perf/Dockerfile.thin .
+#
+# RUN (needs a Modal token mounted or in the environment)
+#   docker run --rm -p 8080:8080 \
+#     -v ~/.modal.toml:/home/app/.modal.toml:ro \
+#     lamp-design:thin
+#
+# Prefer the HTTP front door over a mounted token for a third party: a Modal
+# token is workspace-scoped. See deploy/modal/app.py "HTTP front door" and
+# docs/HANDOFF.md.
+
+FROM --platform=linux/amd64 python:3.10-slim-bookworm
+
+LABEL org.opencontainers.image.description="LAMP primer design portal (thin client, Modal backend)"
+
+# No compiler toolchain: every wheel below is manylinux, so this stays slim.
+RUN pip install --no-cache-dir \
+        "streamlit>=1.65,<2" \
+        "modal>=1.0,<2" \
+        "numpy>=1.26" \
+        "pandas>=2.0" \
+        "biopython==1.88" \
+        "primer3-py>=2.0,<2.1"
+
+# --no-deps so pip cannot drag torch in behind our back, which is the whole
+# point of this image. The import check below is what guards the gap.
+COPY pyproject.toml /app/
+COPY src/ /app/src/
+WORKDIR /app
+RUN pip install --no-cache-dir --no-deps .
+
+COPY deploy/ /app/deploy/
+COPY examples/ /app/examples/
+
+# Assert the shape of the image, both halves of it.
+#
+# The first line is the one that matters: the UI's own modules and the engine
+# paths it uses must import with no torch present. If a future edit moves a
+# model import to module scope, this build fails instead of shipping a portal
+# that dies on first page load.
+RUN python -c "\
+import sys; sys.path.insert(0, '/app/deploy/streamlit');\
+import _backend, _layout, _engine_api, _validation, _results, _tables;\
+from lamp_design.generation import default_geometries, geometry_plan;\
+from lamp_design.utils.sequences import read_fasta;\
+assert 'torch' not in sys.modules, 'torch reached module scope';\
+print('thin portal imports, no torch')" \
+ && python -c "\
+import importlib.util, sys;\
+sys.exit(0 if importlib.util.find_spec('torch') is None else \
+         'torch is installed; this image is meant to be thin')" \
+ && python -c "import streamlit, modal; print('streamlit', streamlit.__version__, '/ modal', modal.__version__)"
+
+# Modal, not local: this image cannot do local compute and says so.
+ENV LAMP_DESIGN_BACKEND=modal \
+    STREAMLIT_SERVER_PORT=8080 \
+    STREAMLIT_SERVER_ADDRESS=0.0.0.0 \
+    STREAMLIT_SERVER_HEADLESS=true \
+    STREAMLIT_BROWSER_GATHER_USAGE_STATS=false \
+    STREAMLIT_SERVER_MAX_UPLOAD_SIZE=5 \
+    HOME=/home/app
+
+RUN useradd -m -u 1000 app && mkdir -p /home/app && chown -R app /home/app /app
+USER app
+
+EXPOSE 8080
+CMD ["sh", "-c", "exec streamlit run --server.port=${PORT:-8080} --server.address=0.0.0.0 /app/deploy/streamlit/app.py"]

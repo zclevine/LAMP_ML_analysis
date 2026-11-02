@@ -866,3 +866,38 @@ def test_the_candidate_estimate_is_length_times_layouts():
     portal = _portal()
     assert portal._round_candidates(5000 * 5) == "~25,000"
     assert portal._round_candidates(1751 * 5) == "~9,000"
+
+
+def test_the_thin_portal_image_excludes_the_model_stack():
+    """The thin image's value is what it does NOT contain.
+
+    Asserted on the Dockerfile rather than by building it, so the contract is
+    checked in CI without a Docker daemon.
+    """
+    text = (APP_DIR.parents[1] / "deploy" / "streamlit" / "perf" / "Dockerfile.thin").read_text()
+    # Instructions only. The header comments name torch/ViennaRNA/MAFFT in
+    # order to explain that they are deliberately absent, so scanning the
+    # whole file finds them and proves nothing -- which is how this test
+    # failed first time round.
+    instructions = "\n".join(
+        line for line in text.splitlines() if not line.lstrip().startswith("#")
+    ).lower()
+    install = instructions[: instructions.index("copy pyproject.toml")]
+    for heavy in ("torch", "viennarna", "mafft"):
+        assert heavy not in install, f"thin image installs {heavy}"
+    # ...must use --no-deps so pip cannot drag torch in behind our back...
+    assert "--no-deps" in text
+    # ...must assert torch is really absent at build time...
+    assert "find_spec('torch') is None" in text
+    assert "'torch' not in sys.modules" in text
+    # ...and must declare the backend it is the only usable one for.
+    assert "LAMP_DESIGN_BACKEND=modal" in text
+
+
+def test_every_portal_image_honours_the_cloud_run_port_contract():
+    """$PORT, 0.0.0.0 and headless, or it will not serve on Cloud Run."""
+    for name in ("Dockerfile.portal", "deploy/streamlit/perf/Dockerfile.thin"):
+        text = (APP_DIR.parents[1] / name).read_text()
+        assert "${PORT:-8080}" in text, f"{name} ignores $PORT"
+        assert "--server.address=0.0.0.0" in text, f"{name} does not bind 0.0.0.0"
+        assert "STREAMLIT_SERVER_HEADLESS=true" in text, f"{name} is not headless"

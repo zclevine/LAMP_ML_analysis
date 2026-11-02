@@ -214,6 +214,7 @@ pays a 1.76s torch import. That part is already right and worth not breaking.
 | change | effort | effect |
 |---|---|---|
 | **`min_instances = 1`** | one Terraform line | removes cold start — **do this first** |
+| **`Dockerfile.thin`** | use this image (Modal backend only) | **3.4 GB → 883 MB**, less image to pull on every cold start |
 | Cloud CDN in front | infra config | −76% bytes, no container cost |
 | `Dockerfile.proxied` | use this image | −76% bytes, ~30 MB image, 2 processes |
 
@@ -221,6 +222,35 @@ pays a 1.76s torch import. That part is already right and worth not breaking.
 spending effort on the other two — it tells you whether they are worth it for
 this audience's connections. Expect it to matter a lot for someone on hotel
 wifi and barely at all on campus.
+
+### Attacking the cold start at its source
+
+The question worth asking is not only "how do we avoid paying the cold start"
+but "why is the cold start so expensive". Most of it is the image, and most of
+the image is an ML stack the container never executes when compute is remote.
+
+[`Dockerfile.thin`](Dockerfile.thin) drops torch (447 MB of site-packages),
+ViennaRNA and MAFFT, keeping Streamlit, the Modal client, and `lamp_design`
+itself — whose model imports are function-local, so validation, generation and
+reporting all import with no torch present. The build asserts both halves of
+that: the UI modules import cleanly, and `torch` is genuinely absent.
+
+Measured:
+
+| | fat portal | thin |
+|---|---|---|
+| image | 3.40 GB | **883 MB** |
+| healthy after (image local) | 2.0 s | **1.27 s** |
+
+The 2.0 → 1.27 s is the smaller half; the real win is that Cloud Run pulls a
+quarter of the bytes before it can start at all. It only works with
+`LAMP_DESIGN_BACKEND=modal`, and the image says so — a local run fails on the
+missing torch rather than silently misbehaving.
+
+This is also the honest answer to "does the Streamlit server have to be active
+immediately?" It does — it serves the page — but it does not have to be
+*large*. Making the always-on thing small is simpler than standing up a second
+service in front of it, and there is nothing extra to operate.
 
 Both compression options leave the 68-request count and the 3 MB JS parse
 untouched. Those are Streamlit's frontend, not something this repo can fix;
