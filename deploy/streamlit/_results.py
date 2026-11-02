@@ -1,4 +1,4 @@
-"""Rendering one run's envelope: metrics, funnel, result tabs, downloads.
+"""Rendering one run's envelope: result tabs and downloads.
 
 Everything here reads the payload that ``report.result_to_dict`` produced, via
 the frame builders in ``_tables``. The split is deliberate: the frames can be
@@ -16,7 +16,6 @@ from _tables import (
     INCLUSIVITY_FIELD,
     evaluate_predictions_display,
     evaluate_ranking_frame,
-    evaluate_metrics_frame,
     is_evaluate,
     predictions_frame,
     funnel_culprit,
@@ -54,7 +53,7 @@ def _download(label: str, frame: pd.DataFrame, filename: str, key: str) -> None:
 
 
 def render_envelope(envelope: dict) -> None:
-    """The whole result: headline metrics, funnel, tables, downloads."""
+    """The whole result: ranked sets, tables, downloads."""
     run_id = envelope["run_id"]
     result = envelope["result"]
     ranking = result.get("ranking") or {}
@@ -161,7 +160,7 @@ def _render_engine_artifacts(run_id: str) -> None:
 
 
 def render_evaluate(envelope: dict) -> None:
-    """An evaluate run: per-row predictions, a set x target matrix, metrics.
+    """An evaluate run: the supplied sets, ranked.
 
     Deliberately not the design layout. ``EvaluationResult`` is rows and
     agreement metrics, not ranked sets against a panel: there is nothing to rank
@@ -209,22 +208,6 @@ def render_evaluate(envelope: dict) -> None:
                 else "."
             )
         )
-
-    metrics = evaluate_metrics_frame(result)
-    if metrics.empty:
-        st.caption(
-            "The input carried no measured-Tp column, so these are predictions only. "
-            "Add a `tp` column to turn the run into a validation: Spearman, MAE and "
-            "ROC-AUC against the measured values are then reported here."
-        )
-    else:
-        st.subheader("Agreement with measured Tp")
-        st.caption(
-            "`amplified` drops rows that recorded no amplification; `censored` keeps "
-            "them at the censoring value, which is the population comparable to the "
-            "published figures."
-        )
-        st.dataframe(metrics, hide_index=True)
 
     ranking = evaluate_ranking_frame(result)
     detail = evaluate_predictions_display(result)
