@@ -1,11 +1,9 @@
 # Build context hygiene: keep the image small and keep weights out of it.
 
-# Model weights are NEVER baked into the image -- they mount at run time and
-# are found via $LAMP_DESIGN_WEIGHTS. Checkpoints are also hundreds of MB.
-weights/
+# The trained ensemble DOES belong in the image: it ships inside the package
+# at src/lamp_design/weights/ and is 2.8 MB. Do not add *.pt / weights/
+# patterns back -- that leaves the image with no model.
 checkpoints/
-*.pt
-*.pth
 *.ckpt
 
 # Local environments and caches

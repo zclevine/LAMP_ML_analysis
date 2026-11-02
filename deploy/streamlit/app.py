@@ -71,7 +71,6 @@ from _engine_api import (  # noqa: E402
     n_available_geometries,
     resolved_device,
 )
-from _tables import funnel_frame  # noqa: E402
 from _validation import (  # noqa: E402
     MAX_PRIMER_SETS,
     MAX_UPLOAD_BYTES,
@@ -958,14 +957,6 @@ def _page_run() -> None:
             st.success(f"Finished: {result['n_sets_returned']} set(s) returned.")
         else:
             st.error("Finished, but no primer sets survived the pipeline.")
-        frame = funnel_frame(result)
-        if not frame.empty:
-            with st.expander("Candidate funnel", expanded=not result.get("sets")):
-                st.caption(
-                    "Surviving candidates after each stage. Every stage records its own "
-                    "count, so an empty result can name the filter that emptied it."
-                )
-                st.dataframe(frame, hide_index=True)
         st.divider()
         if st.button("View results →", type="primary", width="stretch", key="run_to_results"):
             _layout.navigate("results")
@@ -1076,10 +1067,6 @@ def _page_results() -> None:
         st.error("That result does not belong to this session; refusing to display it.")
         return
 
-    st.caption(
-        f"Run `{envelope['run_id']}` — persisted to `{_backend.RUNS_DIR / envelope['run_id']}`. "
-        "That is local disk, and on Cloud Run it is lost on redeploy or a scale event."
-    )
     _results.render(envelope)
 
 

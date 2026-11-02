@@ -283,17 +283,6 @@ def render_sidebar() -> None:
         st.title("LAMP design")
         st.caption("ML-guided eight-primer LAMP set design")
 
-        backend = _backend.active_backend()
-        device = resolved_device() if backend == "local" else "remote GPU"
-        weights_ok, weights_message = weights_status()
-        st.markdown(
-            f"**Backend:** `{backend}`  \n"
-            f"**Device:** `{device}`  \n"
-            f"**Weights:** {'`' + os.path.basename(weights_message) + '`' if weights_ok else '**not configured**'}"
-        )
-        if not weights_ok:
-            st.caption(weights_message)
-
         st.divider()
 
         if st.button("Home", key="sidebar_home", type="tertiary", icon=":material/home:"):
@@ -310,11 +299,6 @@ def render_sidebar() -> None:
             _sidebar_parameters()
             _sidebar_runs()
 
-        st.divider()
-        st.caption(
-            f"Runs are written to `{_backend.RUNS_DIR}`. That is local disk: on Cloud Run "
-            "it is lost on redeploy or a scale event. Download anything you need to keep."
-        )
 
 
 def _sidebar_targets() -> None:
@@ -488,12 +472,6 @@ def preflight_checks() -> tuple[list[str], list[str]]:
             f"{_MODAL_MAX_CONCENTRATIONS} (LAMP_DESIGN_MAX_CONCENTRATIONS). Each one is "
             "another full inference pass over every candidate, and inference is 89% of "
             "a run, so the cap is a spend control rather than a technical limit."
-        )
-    if workflow() == "design" and params["stride"] == 1:
-        cautions.append(
-            "Stride 1 evaluates every anchor position. On the largest supported input "
-            "(5 kb x 10 targets x 4 conditions) that measured 940,520 predictions in "
-            "7.7 minutes on one L4."
         )
     if (
         check is not None

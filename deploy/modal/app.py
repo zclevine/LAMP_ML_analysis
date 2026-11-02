@@ -65,12 +65,15 @@ import modal
 
 APP_NAME = "lamp-design"
 
-#: Volume holding the trained checkpoints. Weights are NOT in this repo and NOT
-#: baked into the image (see .gitignore: `*.pt`, `weights/`). They are mounted
-#: read-only at WEIGHTS_REMOTE and resolved through LAMP_DESIGN_WEIGHTS, which
-#: is exactly what `models.inference.resolve_weights_dir` reads.
-WEIGHTS_VOLUME = os.environ.get("LAMP_DESIGN_WEIGHTS_VOLUME", "lamp-design-weights")
-WEIGHTS_REMOTE = "/weights"
+# No weights Volume. The five-seed ensemble ships inside the package
+# (src/lamp_design/weights/, 2.8 MB), so the image already carries the model
+# and `modal deploy` works on a clean clone in any workspace. It used to be a
+# Volume because the weights were out of git, which meant a fresh workspace had
+# to create and populate a disk before anything would run -- a manual step with
+# nothing behind it once the weights were committed.
+#
+# To run a DIFFERENT ensemble, set LAMP_DESIGN_WEIGHTS via a Secret (see below)
+# and mount it however you like; the engine's resolution order is unchanged.
 
 #: Volume for run artifacts: the panel and candidates the thermo workers read,
 #: and the final result. Modal function *outputs* expire (~24h), so the volume
@@ -94,14 +97,6 @@ LOCAL_REPO = (
     _THIS_FILE.parents[2] if len(_THIS_FILE.parents) > 2 else Path(REPO_REMOTE)
 )
 
-#: Where LAMP_DESIGN_WEIGHTS points inside the container. The layout
-#: `models.inference.discover_checkpoints` expects is `<run>/seed_*/` with one
-#: `best_model_*.pt` each, for seeds 0, 1, 2, 3, 42.
-#: Checkpoint directory inside the weights volume. Named for the training run
-#: suffix rather than the full experiment directory, to match the local layout
-#: (~/lamp-weights/tp60_A_v0t9/seed_{0,1,2,3,42}/best_model.pt) so the same
-#: name works locally and remotely. Override with LAMP_DESIGN_WEIGHTS_SUBDIR.
-WEIGHTS_SUBDIR = os.environ.get("LAMP_DESIGN_WEIGHTS_SUBDIR", "tp60_A_v0t9")
 
 # ---------------------------------------------------------------------------
 # Pinned tool versions
@@ -343,17 +338,16 @@ image = (
     .add_local_dir(
         str(LOCAL_REPO),
         remote_path=REPO_REMOTE,
-        # .venv is multi-GB and weights/ must never reach the image.
+        # .venv is multi-GB. The checkpoint patterns that used to live here
+        # (**/weights/**, **/*.pt, **/*.pth) are gone: the ensemble now ships
+        # inside the package and excluding it left the image with no model.
         ignore=[
             "**/.git/**",
             "**/.venv/**",
             "**/__pycache__/**",
             "**/*.egg-info/**",
             "**/.pytest_cache/**",
-            "**/weights/**",
             "**/runs/**",
-            "**/*.pt",
-            "**/*.pth",
         ],
         copy=True,
     )
@@ -365,7 +359,6 @@ image = (
     )
     .env(
         {
-            "LAMP_DESIGN_WEIGHTS": f"{WEIGHTS_REMOTE}/{WEIGHTS_SUBDIR}",
             "PYTHONUNBUFFERED": "1",
             # Keep BLAS from oversubscribing cores inside a thermo pool worker.
             "OMP_NUM_THREADS": "1",
@@ -400,7 +393,6 @@ image = (
     )
 )
 
-weights_volume = modal.Volume.from_name(WEIGHTS_VOLUME, create_if_missing=True)
 results_volume = modal.Volume.from_name(RESULTS_VOLUME, create_if_missing=True)
 
 #: The spend ledger. A Dict rather than a file on the results volume because
@@ -877,12 +869,10 @@ def _resolve_weights() -> Path:
         pass
     raw = os.environ.get("LAMP_DESIGN_WEIGHTS", "").strip()
     if not raw or not Path(raw).exists():
-        root = Path(WEIGHTS_REMOTE)
-        present = sorted(p.name for p in root.iterdir()) if root.exists() else []
         raise RuntimeError(
-            f"LAMP_DESIGN_WEIGHTS={raw!r} is unset or missing. {WEIGHTS_REMOTE} contains: "
-            f"{present or '<empty>'}. Populate the '{WEIGHTS_VOLUME}' volume "
-            "(see deploy/modal/README.md, 'Weights')."
+            f"LAMP_DESIGN_WEIGHTS={raw!r} is set but does not exist. Unset it to use "
+            "the ensemble bundled in the package, or point it at a directory of "
+            "seed_*/best_model_*.pt."
         )
     return Path(raw)
 
@@ -1422,7 +1412,7 @@ def budget_report() -> dict:
     }
 
 
-@app.function(timeout=300, volumes={WEIGHTS_REMOTE: _read_only(weights_volume)})
+@app.function(timeout=300)
 def doctor() -> dict:
     """Report the container's environment. No GPU, no weights load."""
     import shutil
@@ -1441,7 +1431,6 @@ def doctor() -> dict:
     import numpy
     import RNA
 
-    weights_root = Path(WEIGHTS_REMOTE)
     try:
         weights_status = str(_resolve_weights())
     except Exception as exc:
@@ -1456,9 +1445,6 @@ def doctor() -> dict:
         "lamp_design": lamp_design.__version__,
         "weights_env": os.environ.get("LAMP_DESIGN_WEIGHTS", ""),
         "weights": weights_status,
-        "weights_volume_contents": (
-            sorted(p.name for p in weights_root.iterdir()) if weights_root.exists() else []
-        ),
         "engine_api_present": sorted(k for k in ENGINE_API if _has_engine(k)),
         # The spend ledger, so `doctor` answers "how much have we used?"
         # without starting a GPU. Cheap: one Dict read.
@@ -1475,7 +1461,7 @@ def doctor() -> dict:
     }
 
 
-@app.function(gpu=GPU, timeout=600, volumes={WEIGHTS_REMOTE: _read_only(weights_volume)})
+@app.function(gpu=GPU, timeout=600)
 def doctor_gpu() -> dict:
     """GPU facts, and a real load of the 5-seed ensemble from the volume.
 
@@ -1684,7 +1670,6 @@ def design_fanout(request: dict) -> dict:
     retries=1,
     secrets=SECRETS,
     volumes={
-        WEIGHTS_REMOTE: _read_only(weights_volume),
         RESULTS_REMOTE: results_volume,
     },
 )
@@ -1739,7 +1724,6 @@ def design_shard(job: dict) -> dict:
     retries=0,
     secrets=SECRETS,
     volumes={
-        WEIGHTS_REMOTE: _read_only(weights_volume),
         RESULTS_REMOTE: results_volume,
     },
 )

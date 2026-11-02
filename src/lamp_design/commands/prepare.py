@@ -407,12 +407,7 @@ def _align_if_needed(
     if len(widths) == 1:
         # Ungapped and all the same length: already an alignment (no indels to
         # represent). Nothing is modified, so this is safe -- but say so.
-        warnings.append(
-            f"all {len(records)} sequences are {widths.pop():,} nt with no gaps, so "
-            "they are treated as an alignment and used as given. If they are not "
-            "actually aligned column-for-column, align and trim them before "
-            "running -- lamp-design cannot tell the difference."
-        )
+        widths.pop()
         return list(records)
 
     if aligner is None:
