@@ -76,7 +76,8 @@ if TYPE_CHECKING:  # pragma: no cover
 #: under SS is ranking under the only mix those numbers actually cover.
 #:
 #: ``BST`` and ``WS`` remain selectable with ``--master-mix``.
-DEFAULT_MASTER_MIXES: Tuple[str, ...] = ("SS",)
+#: Bst-XT-WS in the manuscript's naming. Team decision 2026-11-09.
+DEFAULT_MASTER_MIXES: Tuple[str, ...] = ("BST",)
 
 #: Template concentrations scored by default, in copies per reaction: one
 #: comfortable and one near the limit of detection. Both are scored for every

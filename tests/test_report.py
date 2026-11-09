@@ -1096,15 +1096,15 @@ def test_empty_panel_and_empty_result_still_render(tmp_path: Path):
 def test_fast_predictions_are_banded_not_printed():
     from lamp_design.report import format_tp
 
-    assert format_tp(-5.46) == "<5 min"
-    assert format_tp(0.0) == "<5 min"
-    assert format_tp(4.99) == "<5 min"
+    assert format_tp(-5.46) == "<3 min"
+    assert format_tp(0.0) == "<3 min"
+    assert format_tp(2.99) == "<3 min"
 
 
 def test_predictions_above_the_floor_keep_their_value():
     from lamp_design.report import format_tp
 
-    assert format_tp(5.0) == "5.0 min"
+    assert format_tp(3.0) == "3.0 min"
     assert format_tp(12.74) == "12.7 min"
     assert format_tp(59.9) == "59.9 min"
 
@@ -1125,12 +1125,14 @@ def test_no_negative_duration_can_reach_a_user_facing_string():
 
 
 def test_the_band_matches_the_measured_quartile():
-    """5 minutes is where the data puts it, not a round number.
+    """3 minutes, set by the team on 2026-11-09.
 
-    p25 of measured Tp in the curated corpus is 5.06 min (p0.1 = 1.76,
-    p5 = 2.70), so the band is almost exactly "the fastest quartile of
-    everything ever measured".
+    It was 5.0, chosen because p25 of measured Tp in the curated corpus is
+    5.06 min -- "the fastest quartile of everything ever measured". 3 min is
+    a deliberately tighter band: it still sits above p5 (2.70 min), so the
+    floor is not claiming resolution the data does not support, but it leaves
+    more of the range as real numbers a user can compare between runs.
     """
     from lamp_design.report import FAST_TP_FLOOR_MINUTES
 
-    assert FAST_TP_FLOOR_MINUTES == 5.0
+    assert FAST_TP_FLOOR_MINUTES == 3.0

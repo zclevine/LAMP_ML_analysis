@@ -32,6 +32,12 @@ ENGINE_API: dict[str, tuple[str, str]] = {
         "lamp_design.default_geometries",
         "lamp_design.generation.default_geometries",
     ),
+    # Missing until 2026-11-09, which crashed EVERY local design run with
+    # KeyError: 'geometry_plan' -- _backend.run_local calls it before
+    # generation. It was registered in the Modal table and not this one, so the
+    # hosted portal worked and the CPU path, the one we hand to collaborators,
+    # did not. Found by a collaborator running it, not by the suite.
+    "geometry_plan": ("lamp_design.geometry_plan", "lamp_design.generation.geometry_plan"),
     "count_candidate_slots": (
         "lamp_design.count_candidate_slots",
         "lamp_design.generation.count_candidate_slots",
@@ -171,9 +177,11 @@ DEFAULT_N_GEOMETRIES: int = 1 + int(
     engine_default("lamp_design.generation", "DEFAULT_N_SAMPLED", 4)
 )
 
+#: Manuscript names, so the tool and the paper agree. WS is WarmStart, which
+#: the manuscript does not name and the UI does not offer.
 MASTER_MIX_LABELS = {
-    "BST": "BST — BstXT-dk",
-    "SS": "SS",
+    "BST": "Bst-XT-WS",
+    "SS": "Bst-SS",
     "WS": "WS — WarmStart",
 }
 
@@ -188,7 +196,7 @@ PRIMER_TYPE_ORDER: tuple[str, ...] = tuple(
 
 #: The engine's default sweep: 2 master mixes x 2 concentrations.
 DEFAULT_MASTER_MIXES: tuple[str, ...] = tuple(
-    engine_default("lamp_design.commands.design", "DEFAULT_MASTER_MIXES", ("SS",))
+    engine_default("lamp_design.commands.design", "DEFAULT_MASTER_MIXES", ("BST",))
 )
 DEFAULT_CONCENTRATIONS: tuple[float, ...] = tuple(
     float(c)

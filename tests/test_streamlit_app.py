@@ -1179,3 +1179,53 @@ def test_generation_and_hardware_are_not_user_knobs():
         "five sets per anchor: canonical plus four sampled"
     )
     assert layout.DEFAULT_PARAMS["stride"] == 1, "every position, per the design notes"
+
+
+def test_every_engine_lookup_has_an_ENGINE_API_entry():
+    """A missing entry is a KeyError on the user's first click, not at import.
+
+    This is the test that should have existed on 2026-11-09, when every local
+    design run died with KeyError: 'geometry_plan'. `_backend.run_local` calls
+    engine("geometry_plan") before generation; the name was registered in the
+    Modal harness's table and not in this one. So the hosted portal (remote
+    backend) worked, the CPU path -- the one collaborators run -- did not, and
+    the suite never noticed because it does not exercise run_local.
+
+    Static on purpose: it reads the call sites rather than running them, so it
+    covers branches a test run would never reach.
+    """
+    import re
+
+    names: set[str] = set()
+    for path in sorted(APP_DIR.glob("*.py")):
+        for match in re.finditer(r'\bengine\(\s*["\']([A-Za-z_][A-Za-z0-9_]*)["\']', path.read_text()):
+            names.add(match.group(1))
+
+    assert names, "found no engine() call sites -- has the lookup been renamed?"
+    missing = sorted(names - set(_engine_api.ENGINE_API))
+    assert not missing, (
+        f"engine() is called with names absent from ENGINE_API: {missing}. "
+        "Add them to deploy/streamlit/_engine_api.py or the first run that "
+        "reaches that code path raises KeyError."
+    )
+
+
+def test_engine_api_targets_actually_resolve():
+    """An entry pointing at a function that no longer exists is just as broken.
+
+    Each value is (preferred, fallback) dotted paths. At least one must import.
+    """
+    import importlib
+
+    broken = []
+    for key, candidates in _engine_api.ENGINE_API.items():
+        for dotted in candidates:
+            module, _, attr = dotted.rpartition(".")
+            try:
+                if hasattr(importlib.import_module(module), attr):
+                    break
+            except Exception:
+                continue
+        else:
+            broken.append(key)
+    assert not broken, f"ENGINE_API entries resolve to nothing: {broken}"

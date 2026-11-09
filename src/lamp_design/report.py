@@ -634,7 +634,7 @@ def _conc(value: Any) -> str:
 #: 2.70, and the 25th is **5.06**. So "< 5 min" is almost exactly "in the
 #: fastest quartile of everything we ever measured", and the model cannot
 #: resolve within it in a way a user should act on.
-FAST_TP_FLOOR_MINUTES: float = 5.0
+FAST_TP_FLOOR_MINUTES: float = 3.0
 
 
 def format_tp(minutes: Optional[float]) -> str:

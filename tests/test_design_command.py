@@ -65,7 +65,7 @@ def test_default_conditions_are_one_mix_at_two_concentrations():
     """
     conds = build_conditions()
     assert len(conds) == len(DEFAULT_MASTER_MIXES) * len(DEFAULT_CONCENTRATIONS) == 2
-    assert [c.master_mix for c in conds] == ["SS", "SS"]
+    assert [c.master_mix for c in conds] == ["BST", "BST"]
     assert {c.target_conc for c in conds} == set(DEFAULT_CONCENTRATIONS)
     # The default ranking condition is the comfortable concentration, so the
     # low-copy prediction never silently drives the ranking.

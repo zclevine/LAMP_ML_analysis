@@ -109,7 +109,9 @@ class TestPanelShape:
         assert panel.alignment == [seq for _, seq in records]
         assert panel.consensus == plurality_consensus([s for _, s in records])
         assert panel.budget == 4 * 300
-        assert any("treated as an alignment" in w for w in prepared.warnings)
+        # No warning: equal-length ungapped input is the required shape, so
+        # saying so on every run was noise. Removed 2026-11-09.
+        assert not any("treated as an alignment" in w for w in prepared.warnings)
 
     def test_multi_sequence_unequal_length_is_aligned(self):
         records = [("long", make_seq(300)), ("short", make_seq(250, shift=3))]

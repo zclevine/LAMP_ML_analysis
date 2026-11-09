@@ -18,17 +18,25 @@ SPEED_FIELD = "mean_predicted_tp_minutes_lower_is_faster"
 INCLUSIVITY_FIELD = "inclusivity_fraction_targets_below_tp_threshold"
 
 
+def _format_speed(minutes: Any) -> str:
+    """Predicted speed, banded. One definition, shared with the CLI report."""
+    from lamp_design.report import format_tp
+
+    return format_tp(None if minutes is None else float(minutes))
+
+
 def sets_frame(result: dict) -> pd.DataFrame:
     """One row per returned set: rank, placement, scores, the eight primers."""
     rows = []
     for entry in result["sets"]:
-        # No Tp columns, and no geometry id.
+        # A BANDED speed figure, and no geometry id.
         #
-        # Tp: the model's output is used to ORDER the sets and is not shown as a
-        # number. It can be negative (training floors the label at -100 and the
-        # measured labels reach -4.6), the model does not resolve differences
-        # inside the fastest quartile, and a displayed minute figure invites
-        # comparisons it cannot support. The rank is the result.
+        # Speed came back by request: a rank alone cannot be compared between
+        # two different runs, and an absolute measure can. It is banded rather
+        # than raw -- anything under FAST_TP_FLOOR_MINUTES reads "<3 min" --
+        # because the model does not resolve differences inside the fastest
+        # band and the raw value can be negative (training floors the label at
+        # -100; measured labels reach -4.611).
         #
         # Geometry: the id names an internal spacing/length layout -- since
         # cbfd454 most are drawn from a distribution, so the id is an index into
@@ -40,6 +48,7 @@ def sets_frame(result: dict) -> pd.DataFrame:
             "anchor": entry["anchor"],
             "span_start": entry["span_start"],
             "span_end": entry["span_end"],
+            "speed": _format_speed(entry.get(SPEED_FIELD)),
             "inclusivity": entry[INCLUSIVITY_FIELD],
             "total_mismatches": entry.get("total_primer_target_mismatches_all_targets"),
         }
