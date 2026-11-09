@@ -25,6 +25,27 @@ without supplying sequences of your own.
 The first build takes several minutes (it solves a conda environment and
 verifies the thermodynamics tools). Subsequent builds are cached.
 
+### On a Mac, with colima
+
+Colima works — it provides a Docker-compatible daemon, so the commands above
+are unchanged — but give the VM real resources first:
+
+```bash
+colima start --cpu 4 --memory 8
+```
+
+A design run peaks at **3.4 GB** of memory. Colima's default VM is small, so the
+default will either run out of memory or thrash, and it will look like the tool
+is broken rather than starved.
+
+**If you are on Apple Silicon, expect it to be slow.** Both images are pinned
+`--platform=linux/amd64`, because the conda packages this depends on
+(ViennaRNA in particular) are not reliably available for `aarch64`. On an
+M-series Mac that means every instruction runs through x86 emulation, typically
+several times slower than native. The timings in [How long it takes](#how-long-it-takes)
+are for native x86 — do not use a Mac to decide whether the CPU path is fast
+enough for a deployment. Measure on the hardware you will actually deploy on.
+
 ### If you do not use Docker
 
 ```bash
