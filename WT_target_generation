@@ -1,0 +1,111 @@
+class TargetGeneration:
+    
+    def __init__(self, scaler, pca, principal_components):
+        """Initialize with dinucleotide PCA and sampling preferences.
+        
+        Args:
+            pca: PCA of dinucleotide frequencies
+            principal_components: principal components from previous step 
+            scaler: sclaer function fit to data in previous step 
+            
+        """
+        self.pca = pca
+        self.principal_components = principal_components
+        self.scaler = scaler
+        self.n_comp = pca.n_components_
+        self.b2i = {"A" : 0,"C" : 1,"G" : 2,"T" : 3}
+        
+    #define function to select sample radius 
+    
+    def select_sample_radius(self, percentile = 95):
+        self.sample_radius = np.percentile(standardized_data, 95)
+        
+        return self.sample_radius
+    
+
+        
+    def add_blocks(self,n_blocks,len_block):
+        
+        
+        #define function for selecting coordinates 
+        def get_rand_coord(self):
+            rcoord = self.sample_radius + 1
+            while np.linalg.norm(rcoord) > self.sample_radius:
+                rcoord = np.random.uniform(-1 * self.sample_radius, self.sample_radius,
+                                           size=self.n_comp)
+            return rcoord
+        
+        #initate empty seq object 
+        self.seq = "" 
+        self.coords_list = []
+        self.block_seqs = []
+        
+        for b in range(n_blocks) :
+            if b == 0 : #if its the first base you must seed 
+                self.seq += np.random.choice(list("ACGT")) #seed with random 
+
+                end_point = len_block - 1 
+            else :
+                end_point = len_block
+
+            # select random coordations from the PCA
+            pca_coords = get_rand_coord(self)
+            #add the coords to the list 
+            self.coords_list.append(pca_coords)
+            
+            #inverse transform and inverse scale the coords 
+            comp_app_scaled = scaler.inverse_transform(self.pca.inverse_transform(pca_coords).reshape(1, -1)).reshape(4,4)
+            pmat = comp_app_scaled / np.sum(comp_app_scaled, axis=1, keepdims=True)
+
+
+            # fill in the block 
+            for i in range(0,end_point) : 
+
+                probs = pmat[self.b2i[self.seq[-1]],:].copy()
+                self.seq += "".join(np.random.choice(list("ACGT"), p=probs)) #add the new base by making a random choice with the probabilities 
+
+            #add the block seq to the list 
+            self.block_seqs.append(self.seq[-len_block:])
+            
+        return self.seq, self.coords_list, self.block_seqs
+
+    
+    
+    def add_gaps(self,gap_starts = [49, 93, 122, 166, 195, 239, 268], gap_lens = [5,12,20]) :
+        
+        self.block_seqs_with_gaps = {}
+    
+        
+        for b, (block_seq, block_coords) in enumerate(zip(self.block_seqs, self.coords_list)) :
+
+            for gap_start in gap_starts:
+                
+
+                seed_seq = block_seq[0:gap_start]
+                
+                comp_app_scaled = scaler.inverse_transform(self.pca.inverse_transform(block_coords).reshape(1, -1)).reshape(4,4)
+                pmat = comp_app_scaled / np.sum(comp_app_scaled, axis=1, keepdims=True)
+            
+            
+    
+                for gap_len in [5,12,20] : 
+                    
+                    gap_seq = seed_seq 
+                
+                    for i in range(0,gap_len) : 
+
+                        probs = pmat[self.b2i[seed_seq[-1]],:].copy()
+                        gap_seq += "".join(np.random.choice(list("ACGT"), p=probs)) #add the new base by making a random 
+
+                    
+                    if len(gap_seq)- len(block_seq[0:gap_start]) != gap_len:
+                        print("Error!")
+                        
+                    else :
+                        self.block_seqs_with_gaps[f'block_{b}_gap_start{gap_start}_len{gap_len}'] = {'sequence': gap_seq + block_seq[gap_start:],
+                                                         'gap_start':gap_start,'gap_len':gap_len}
+               
+                        
+        
+                        
+        return self.block_seqs_with_gaps

@@ -1,0 +1,127 @@
+class DinucleotideAnalysis:
+    
+    def __init__(self, data):
+        """Initialize with dinucleotide frequency data and scaling preference.
+        
+        Args:
+            data: DataFrame of dinucleotide frequencies
+            scale: bool, whether to scale data before PCA (default True)
+        """
+        self.data = data
+        self.standardized_data = None
+        self.pca = None
+        self.principal_components = None
+        self.explained_variance = None
+        
+    def scale_and_transform_data(self, transform = None, normalize = True, standardize = True):
+        """Prepare data with standardization and optional clr and normalization"""
+        self.standardized_data = self.data
+        if normalize:
+            self.standardized_data = self.standardized_data.div(self.standardized_data.sum(axis=1), axis=0)
+
+        if standardize :
+            scaler = StandardScaler()
+            self.standardized_data = scaler.fit_transform(self.standardized_data)
+        if transform == 'clr':
+            self.standardized_data = self.clr_transform(self.standardized_data)
+            
+        return np.array(self.standardized_data)
+            
+    def fit_pca(self):
+        """Fit PCA and calculate explained variance."""
+        if self.standardized_data is None:
+            self.scale_and_transform_data()
+            
+        self.pca = PCA().fit(self.standardized_data)
+        self.explained_variance = self.pca.explained_variance_ratio_
+        
+        return self.pca
+    
+    def fit_pca_ncomp(self,ncomp = 3):
+        """Fit PCA and calculate explained variance."""
+        if self.standardized_data is None:
+            self.scale_and_transform_data()
+            
+        self.pca = PCA(n_components = ncomp).fit(self.standardized_data)
+        self.explained_variance = self.pca.explained_variance_ratio_
+        
+        return self.pca
+        
+    def plot_scree(self):
+        """Plot scree plot of explained variance."""
+        if self.explained_variance is None:
+            self.fit_pca()
+            
+        plt.figure(figsize=(10, 6))
+        # print(self.explained_variance)
+        y = np.asarray([0] + list(np.cumsum(self.explained_variance))) # make this code better
+        x = np.asarray(range(0, len(y)))
+        plt.plot(x,y, marker='o')
+        plt.xlabel('Number of Components')
+        plt.ylabel('Cumulative Explained Variance')
+        plt.title('Scree Plot')
+        plt.grid()
+        plt.show()
+        
+    def plot_pc1_distribution(self):
+        """Plot data points along first principal component axis."""
+        if self.pca is None:
+            self.fit_pca()
+            
+        # Get PC1 scores by transforming data
+        pc1_scores = self.pca.transform(self.standardized_data)[:,0]
+            
+        plt.figure(figsize=(15, 5))
+        plt.scatter(pc1_scores, np.zeros_like(pc1_scores))
+        
+        # Add labels for each point
+        for i, (x, _) in enumerate(zip(pc1_scores, np.zeros_like(pc1_scores))):
+            plt.annotate(self.data.index[i], (x, 0), xytext=(0, 10),
+                        textcoords='offset points', ha='center', va='bottom', 
+                        rotation=45)
+            
+        plt.title('Data Points Projected onto First Principal Component')
+        plt.xlabel('PC1')
+        plt.yticks([])  # Hide y-axis ticks since we're only showing PC1
+        plt.grid(True, axis='x')
+        plt.tight_layout()
+        plt.show()
+        
+    def plot_pc1_vs_length(self):
+        """Plot data points along first principal component axis."""
+        if self.pca is None:
+            self.fit_pca()
+            
+        # Get PC1 scores by transforming data
+        pc1_scores = self.pca.transform(self.standardized_data)[:,0]
+            
+        plt.figure(figsize=(15, 5))
+        plt.scatter(x = pc1_scores, y = self.data.sum(axis = 1) )
+            
+        plt.title('Data Points Projected onto First Principal Component')
+        plt.xlabel('PC1')
+        plt.ylabel('Total dinucleotides')
+        plt.yticks([])  # Hide y-axis ticks since we're only showing PC1
+        plt.grid(True, axis='x')
+        plt.tight_layout()
+        plt.show()
+        
+    def get_n_components(self, variance_threshold=0.95):
+        """Get number of components needed for given variance threshold."""
+        if self.explained_variance is None:
+            self.fit_pca()
+            
+        cumulative_variance = np.cumsum(self.explained_variance)
+        n_components = np.argmax(cumulative_variance >= variance_threshold) + 1
+        return self.explained_variance[:n_components]
+
+            
+analysis = DinucleotideAnalysis(dicounts)
+standardized_data = analysis.scale_and_transform_data()
+myPCA = analysis.fit_pca_ncomp(ncomp = 3)
+analysis.plot_scree()
+analysis.plot_pc1_distribution()
+analysis.plot_pc1_vs_length()
+# # analysis.print_sorted_pc1()
+components_95 = analysis.get_n_components(0.95)
+print(f"Number of components needed for 95% variance: {components_95}")
