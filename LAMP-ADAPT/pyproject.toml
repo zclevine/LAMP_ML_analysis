@@ -1,0 +1,54 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "lamp-design"
+version = "0.1.0"
+description = "ML-guided LAMP primer set design"
+requires-python = ">=3.10"
+dependencies = [
+    "numpy>=1.26",
+    "pandas>=2.0",
+    "biopython>=1.83",
+    # Pinned below 2.1: the training data's tm column was computed with 2.0.x,
+    # and 2.1.0 changed santalucia salt correction so every Tm shifts +2.17 C.
+    # Verified exact on all 80 Borrelia primers at 2.0.0-2.0.3, off at 2.1.0+.
+    "primer3-py>=2.0,<2.1",
+    "ViennaRNA>=2.6",
+    "torch>=2.2",
+    "scipy>=1.11",
+    # Required by the vendored S4D kernel (models/lyra/s4d.py), which imports
+    # it at module level and is on the production inference path. It was
+    # missing here until the first real Modal run died on it: this box had it
+    # installed by hand, so every local run worked and the declared dependency
+    # set was quietly incomplete. `fla` and `mamba_ssm` are NOT listed on
+    # purpose -- lyra_base.py imports them inside non-s4d branches only, and
+    # the production config is ssm=s4d.
+    "einops>=0.8",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0", "pytest-cov"]
+streamlit = ["streamlit>=1.40"]
+modal = ["modal>=0.64"]
+
+[project.scripts]
+lamp-design = "lamp_design.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+# The five-seed ensemble ships inside the package: 2.8 MB total, so a clone or
+# a `pip install` runs with no configuration and no separate download. An
+# explicit --weights or $LAMP_DESIGN_WEIGHTS still overrides, which is how you
+# point at a retrained ensemble.
+[tool.setuptools.package-data]
+lamp_design = ["weights/*/*/*.pt"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# "tests" is here so test modules can import shared helpers by name (see
+# tests/_weights.py). Relying on pytest's prepend-import-mode side effect to
+# put tests/ on sys.path does not work once pythonpath is set explicitly.
+pythonpath = ["src", "tests"]
