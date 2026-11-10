@@ -25,7 +25,7 @@ Code for designing LAMP (loop-mediated isothermal amplification) primer sets, an
 | `BioMarkAnalysisLML_v20260522.py` | Current `BioMarkAnalysisLML` class. Converts a 96-well plate layout to the BioMark IFC chip layout, processes raw FAM/ROX fluorescence, and writes figures and results to a dated output folder. |
 | `BioMarkAnalysisLASV_FINAL.py` | Final `BioMarkAnalysisLASV` class used for the Lassa virus (LASV) experiments. |
 
-### LAMP-ADAPT
+### lamp-design
 Self-contained code for LAMP-ADAPT predictions (see README.md in folder) 
 
 See the notebooks for end-to-end examples.
@@ -40,7 +40,7 @@ Manuscript in preparation; contact for details
 
 ## Contact
 
-Zoë Levine, Sabeti Lab, Broad Institute (zlevine@broadinstitute.org)
-Tsion Abay, Sabeti Lab, Broad Institute (tabay@broadinstitute.org)
-Sameed Siddiqui, Sabeti Lab, Broad Institute (ssiddiqui@broadinstitute.org)
-Pardis Sabeti, Sabeti Lab, Broad Institute (pardis@broadinstitute.org)# LAMP_ML
+Zoë Levine, Sabeti Lab, Broad Institute (zlevine@broadinstitute.org) \
+Tsion Abay, Sabeti Lab, Broad Institute (tabay@broadinstitute.org) \
+Sameed Siddiqui, Sabeti Lab, Broad Institute (ssiddiqui@broadinstitute.org) \
+Pardis Sabeti, Sabeti Lab, Broad Institute (pardis@broadinstitute.org)
